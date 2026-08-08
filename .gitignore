@@ -1,0 +1,63 @@
+# ATELIER H3 Local Studio — Git 管理から除外するもの
+# 方針: 「大きいもの」「個人の環境に固有のもの」「秘密になりうるもの」「作り直せるもの」は入れない。
+
+# ---- Python 環境（作り直せる。setup.sh で再生成） ----
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# ---- モデル本体と外部リポジトリ（巨大。Git に入れない） ----
+# DiffSynth-Studio / MiniMax-H3-NF4 / Turbo LoRA はこのリポジトリの外
+# （既定 /Users/<あなた>/AI/DiffSynth-Studio）に置き、パスは config.toml で指す。
+DiffSynth-Studio/
+models/
+*.safetensors
+*.ckpt
+*.bin
+*.pth
+
+# ---- 生成物・履歴・ログ（ユーザー固有。復元不能なので必ずバックアップを） ----
+# data/ 以下がアプリの唯一の書き込み先。動画・履歴・ログ・一時ファイル・QR画像を含む。
+data/
+*.partial
+*.bak
+*.tmp.mp4
+*.log
+
+# ---- 個人環境に固有の設定（絶対パスを含む） ----
+# config/config.toml には worker_python など各自の絶対パスが入る。
+# 公開するのは config/config.example.toml のほう。
+config/config.toml
+config/config.local.toml
+
+# ---- macOS / エディタ ----
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.idea/
+.vscode/
+
+# ---- Claude Code のローカル設定 ----
+.claude/settings.local.json
+
+# ---- テスト・実機試験の生成物 ----
+# （テストは tmp_path 上で動くが、手元で試した残骸を誤って入れないための保険）
+/tmp_test/
+*_result.json
+p5_real*.log
+
+# ---- モック素材（setup.sh が ffmpeg で生成する。バイナリなので入れない） ----
+app/assets/mock/*.mp4
+app/assets/mock/*.png
+
+# ---- 補足 ----
+# PIN は「どこにも保存しない」設計のため、除外対象のファイル自体が存在しない。
+# QR画像は data/tmp/ に 0o600 で作られ、正常終了時に削除される（data/ で除外済み）。

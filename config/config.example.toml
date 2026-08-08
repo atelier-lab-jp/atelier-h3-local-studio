@@ -1,0 +1,128 @@
+# ATELIER H3 Local Studio V1 設定ファイルの雛形（設計書 §12・§22）
+#
+# 使い方:
+#   1. このファイルを同じフォルダに config.toml という名前でコピーする
+#   2. [backends.minimax_h3] の worker_python / working_directory を
+#      自分の環境の実際の場所に書き換える（下のコメント参照）
+#   3. アプリを起動する（変更後は必ず再起動してください）
+#
+# このファイル自体は雛形なのでアプリからは読み込まれません。
+# 読み込まれるのは同じフォルダの config.toml だけです。
+
+schema_version = 1
+
+[app]
+name = "ATELIER H3 Local Studio"
+version = "1.0.0"
+
+[engine]
+mode = "real"              # 実行方式（Execution Engine）: "real" | "mock"
+                           # real = 実際の MiniMax-H3 で生成（1本あたり約6〜7分）
+                           # mock = ダミー動画を数秒で返す（UI開発・動作確認用）
+                           # 一時的に切り替えるなら ./scripts/start.sh --mode mock
+                           # 環境変数 ATELIER_MOCK=1 / 0 がこの設定より優先されます
+backend = "minimax_h3"     # 生成バックエンド（Generation Backend）。
+                           # V1 で利用可能なのは minimax_h3 のみ。
+                           # 切替はこの値の変更＋アプリ再起動（実行中の切替はしない）
+
+[server]
+host = "127.0.0.1"         # 変更しないでください（外部公開しない設計）
+port = 7860
+auto_open_browser = true
+
+[paths]
+data_root   = "./data"     # アプリプロジェクトからの相対パス（唯一の書き込み先）
+ffmpeg_path = ""           # 空ならアプリvenvの imageio-ffmpeg 同梱バイナリを自動使用
+
+[backends.minimax_h3]      # V1 唯一の生成バックエンド（実機検証済み構成。設計書 §0.1）
+display_name      = "MiniMax H3 NF4 Turbo"
+
+# ↓↓↓ ここの2つは自分の環境に合わせて書き換えてください ↓↓↓
+# worker_python     … DiffSynth-Studio の既存 venv の python 実体（絶対パス）
+#                     例: "<DiffSynth-Studioの場所>/.venv/bin/python"
+# working_directory … DiffSynth-Studio 本体のフォルダ（絶対パス）。
+#                     このフォルダは読み取り専用として扱われ、
+#                     アプリの書き込みは data_root 配下だけに限定されます。
+worker_python     = "/path/to/DiffSynth-Studio/.venv/bin/python"
+working_directory = "/path/to/DiffSynth-Studio"
+# ↑↑↑ ここまで ↑↑↑
+
+worker_script     = "app/engine/backends/minimax_h3/h3_worker.py"  # プロジェクト相対（変更不要）
+model_id          = "DiffSynth-Studio/MiniMax-H3-NF4"
+model_revision    = "nf4-turbo4step-ckpt500"              # 履歴に記録するチェックポイント識別子
+processor_id      = "MiniMax/MiniMax-H3"
+lora_relpath      = "models/loras/minimax_h3_turbo_4step_ckpt500.safetensors"
+lora_alpha        = 1.0
+
+[generation]               # 実機検証済みの固定値。UIからは変更不可
+width  = 576
+height = 320
+fps    = 24
+allowed_num_frames = [56, 124]
+allowed_steps      = [4, 8]
+audio_sample_rate  = 32000
+default_num_frames = 56
+default_steps      = 4
+seed_max           = 2147483647
+
+[estimates]                # 進捗の目安表示・停滞警告に使用（秒）。実測で更新する
+init_sec     = 10          # モデル初期化目安（実測: 約5秒）。
+                           # ディスクオフロード構成では from_pretrained は構造構築のみで、
+                           # 重みは生成中にストリーミングされる（初期化は速く生成が遅い）
+f56_s4_sec   = 403         # 2.33秒・4step（実測: 405.8 / 400.8 / 400.7 秒）
+f124_s4_sec  = 819         # 5.17秒・4step（実測: 819.0秒。目安との比 1.01）
+step8_factor = 1.67        # 8step は 4step の約1.67倍（実測: 677.6 ÷ 403 = 1.68）
+stall_warn_factor = 3.0    # 目安×この係数を超えたら「応答が遅い」警告（自動停止はしない）
+stall_abort_factor = 0.0   # 目安×この係数を超えたら強制的に失敗させる。
+                           # 既定 0.0 = 無効（設計書 §13.2「自動停止はしない」を守る）。
+                           # 有効にする場合は 10.0 以上を推奨
+
+[queue]
+max_queued_jobs     = 20   # 積みすぎ防止（超過時は追加を断る）
+allow_cancel_queued = true
+auto_restart_worker = true
+max_auto_restarts   = 2    # 「連続失敗」の自動再起動上限。1本正常完了で0にリセット
+restart_backoff_sec = [5, 30]  # 自動再起動前の待機秒（1回目5秒、2回目以降30秒）
+
+[concat]
+# V1 の連結方式は「各クリップのPTSを0起点に正規化してから再エンコード」の1つだけです。
+# reencode キーは廃止しました。書くと起動時にエラーになります。
+
+# 連結境界の重複1フレーム除去。親の最終フレームと子の先頭フレームは
+# 同一画像になりうるため、24fps で約41.7ms 余分に静止して見えることがあります。
+# ただし**無条件には削除しません**: 実際に2枚を比較し、十分に一致する境界だけ除去します。
+dedupe_boundary_frame = false   # 既定 OFF（実機測定の結果 OFF が正しいと判断。§10.6.1）
+dedupe_max_mean_diff  = 1.0     # 画素差の平均がこれ以下なら「一致」とみなす（0-255）
+dedupe_max_max_diff   = 16.0    # 画素差の最大がこれ以下なら「一致」とみなす（0-255）
+
+# 連結結果の検証は「フレーム数」が主で、再生時間は補助です。
+#   フレーム数: 各動画のフレーム数の合計以上 かつ 合計＋(本数-1)×0.768 以下
+#   再生時間  : 0.5秒 ＋ (本数-1)×0.032秒 以内、かつ想定の95%以上
+# 0.032秒 は AAC の1フレーム（1024サンプル ÷ 32000Hz）です。音声はこの単位でしか
+# 書けないため各クリップの音声が映像より最大32ms長くなり、連結の境界ごとに
+# 最大1フレームぶんの重複が入ります。だから許容差は本数ではなく境界数に比例します。
+# これらの値はコードの定数で、設定ファイルからは変更できません。
+
+[lan]
+# iPhone接続モード（LANモード）の調整値です。
+# **このセクションでLANモードが有効になることはありません。**
+# 有効にできるのは起動時の --lan オプションだけです（設定ファイルでは有効化できません）。
+host_override     = ""     # 空なら自動検出。手動指定するときは同じWi-Fi内のIPアドレス
+                           # （192.168.x.x / 10.x.x.x / 172.16〜31.x.x のみ）
+pin_digits        = 6      # iPhone から接続するときのPINの桁数（4〜12）
+max_auth_failures = 10     # PINを連続で何回間違えたら一時的に締め出すか
+auth_lockout_sec  = 30     # 締め出す秒数
+# PIN そのものは設定ファイルに書きません（起動のたびに自動生成し、画面にだけ表示します）。
+
+[logging]
+level        = "INFO"
+max_bytes    = 5242880     # 5MB × backup_count で回転
+backup_count = 3
+
+[safety]
+warn_free_disk_gb = 20     # 空きがこれ未満なら警告表示（動作は継続）
+stop_free_disk_gb = 5      # 空きがこれ未満なら新規生成・連結の受付を停止
+                           # （既存動画は削除しない。整理はFinderでユーザー自身が行う）
+
+[mock]
+speed_factor = 40.0        # モック時は目安時間の 1/40 で進捗を再現

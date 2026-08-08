@@ -1,0 +1,19 @@
+[project]
+name = "atelier-h3-local-studio"
+version = "1.0.0"
+description = "ATELIER H3 Local Studio - MiniMax-H3 完全ローカル動画生成スタジオ（UIプロセス側）"
+requires-python = ">=3.11"
+dependencies = [
+    "gradio==6.22.0",
+    "imageio-ffmpeg>=0.6.0",
+    "pillow>=11",          # fileops.verify_png が直接使うため明示依存にする
+    "segno>=1.6.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = false
