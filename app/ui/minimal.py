@@ -284,6 +284,11 @@ CUSTOM_CONCAT_LABEL = "▶ この順番で連結（2本以上選んでくださ�
 #: 順番指定連結の補助操作（P5.3-A 仕上げ）。
 #: 「削除」はファイルを消す操作と紛らわしいので**「候補から外す」**にした。
 #: 実際に消えるのは、この画面で組み立てている**順番だけ**である。
+#: アプリ内ゴミ箱（P5.3-B）。移動先は `data_root/trash`（config が正本）。
+#: ここはあくまで画面に出す文字列で、実際のパスは `cfg.trash_dir` から解決する。
+TRASH_DIR_LABEL = "trash"
+TRASH_BUTTON_LABEL = "🗑 ゴミ箱へ移動"
+
 CUSTOM_ADD_LABEL = "＋ 連結候補へ追加"
 CUSTOM_UP_LABEL = "↑ 1つ上へ"
 CUSTOM_DOWN_LABEL = "↓ 1つ下へ"
@@ -1017,6 +1022,8 @@ def build_ui(
     # P5.2: 指定順連結。サービス側が未対応でも③タブは今までどおり動く
     _has_custom_concat = hasattr(service, "start_custom_concat")
     _has_concat_candidates = hasattr(service, "concat_candidates")
+    # P5.3-B: アプリ内ゴミ箱（未対応のサービスでも③は従来どおり使える）
+    _has_trash = hasattr(service, "move_to_trash")
 
     def _submit_accepts_continuation() -> bool:
         """`submit_generation` が parent_id / keyframe_path を受けるか調べる。"""
@@ -1069,10 +1076,14 @@ def build_ui(
         if not callable(finder):
             return None
         try:
-            return finder(_attr(row, "job_id", ""), "concat")
+            concat_row = finder(_attr(row, "job_id", ""), "concat")
         except Exception:  # 連結行が取れなくても履歴一覧は出す
             log.exception("連結行を取得できませんでした: %s", _attr(row, "job_id", ""))
             return None
+        # 連結動画のファイルが無ければ④にも出さない（P5.3-B: 実在が表示の正本）
+        if concat_row is None or not _attr(concat_row, "exists", False):
+            return None
+        return concat_row
 
     def _concat_product_rows() -> list:
         """④の「連結成果物」フィルタ用（チェーン連結＋指定順連結・新しい順）。"""
@@ -1119,8 +1130,11 @@ def build_ui(
 
         以前はここに全動画の Markdown 表を出していたが、27件で3,000px を超え、
         下にある順番指定連結まで延々とスクロールする必要があった。表は④履歴タブへ
-        一本化し、③は「何件あるか」と「欠損が何件あるか」だけを1〜2行で示す。
-        件数は選択候補と同じ行から数えるので、画面と候補が食い違わない。
+        一本化し、③は「何件あるか」だけを1行で示す。件数は選択候補と同じ行から
+        数えるので、画面と候補が食い違わない。
+
+        数えるのは**実際にファイルがある動画だけ**（P5.3-B）。Finder で消せば
+        次の更新で件数から減り、正式パスへ戻せばまた増える。
         """
         if not _has_completed_videos:
             return f"### 完成した動画\n{_UNSUPPORTED}"
@@ -1132,24 +1146,16 @@ def build_ui(
         clips = sum(1 for r in rows if _attr(r, "kind", "clip") == "clip")
         chains = sum(1 for r in rows if getattr(r, "concat_kind", None) == "chain")
         manuals = sum(1 for r in rows if getattr(r, "concat_kind", None) == "manual")
-        missing = sum(1 for r in rows if not _attr(r, "exists", False))
 
         parts = [f"個別{clips}件"]
         if chains:
             parts.append(f"チェーン連結{chains}件")
         if manuals:
             parts.append(f"指定順連結{manuals}件")
-        head = f"**完成した動画: {len(rows)}件**（{'・'.join(parts)}）"
-        if missing:
-            head += f" ｜ ファイル欠損 {missing}件"
-        lines = [head, "", "一覧は「履歴」タブで見られます。"]
-        if missing:
-            lines.append(
-                f"\n⚠️ ファイルが見つからない記録が {missing} 件あります"
-                "（Finder などで動画を削除するとこうなります）。"
-                "**記録を片づける機能は次の工程で追加予定**です。"
-            )
-        return "\n".join(lines)
+        return (
+            f"**完成した動画: {len(rows)}件**（{'・'.join(parts)}）\n\n"
+            "一覧は「履歴」タブで見られます。"
+        )
 
     def _concat_products_table(rows: list) -> str:
         """④履歴タブの「連結成果物」フィルタ用の表（P5.3-A）。
@@ -1783,6 +1789,89 @@ def build_ui(
     def on_start_concat(key):
         return _concat_message(key), _concat_status_text()
 
+    # ------------------------------------- ③アプリ内ゴミ箱（P5.3-B・設計書 §25）
+    #
+    # 「消す」は **`data/trash/` へ移すだけ**。削除台帳も復元UIも依存関係の検査も
+    # 持たない。画面から消えるのは「ファイルが無くなったから」であって、
+    # どこかに消したと記録するからではない。
+
+    def _trash_controls(key) -> tuple:
+        """選択に応じて整理セクションの出し入れを決める（3値）。
+
+        **実在する動画を選んだときだけ**出す。記録だけの動画は一覧にも
+        候補にも出ないので、ここへ来ることも基本的に無い。
+        """
+        if not _has_trash:
+            return gr.update(visible=False), gr.update(visible=False), gr.update(value=False)
+        row = _find_row(_completed_rows(), str(key or "").strip())
+        if row is None or not _attr(row, "exists", False):
+            return gr.update(visible=False), gr.update(visible=False), gr.update(value=False)
+        job_id = _attr(row, "job_id", "")
+        return (
+            gr.update(visible=True),
+            gr.update(visible=True, value=f"🗑 ゴミ箱へ移動: {job_id}"),
+            gr.update(value=False),  # 選び直したら確認は必ず外す
+        )
+
+    def on_selection_changed_for_trash(key):
+        try:
+            return _trash_controls(key)
+        except Exception:  # 設計書 §13.2
+            log.exception("整理セクションの表示を更新できませんでした")
+            return gr.update(visible=False), gr.update(visible=False), gr.update(value=False)
+
+    def on_move_to_trash(key, confirmed):
+        """[ゴミ箱へ移動]。送るのは選択キーだけで、パスはサーバ側で解決する。
+
+        成功したら、その場で選択・プレビュー・確認チェックを片づけ、件数と
+        候補も更新する（別セッションは次の Timer 更新で消える）。
+        """
+        kind, job_id = _split_key(key)
+        unchanged = (
+            gr.update(),  # 選択欄
+            gr.update(),  # プレビュー
+            gr.update(),  # メタ
+            gr.update(),  # 詳しい情報
+            gr.update(),  # 要約
+            gr.update(),  # 追加候補
+            gr.update(),  # 整理セクション
+            gr.update(),  # ゴミ箱ボタン
+            gr.update(),  # 確認チェック
+        )
+        if not _has_trash:
+            return (*unchanged, f"⚠️ {_UNSUPPORTED}")
+        if not job_id:
+            return (*unchanged, "⚠️ 整理する動画を選んでください。")
+        if not confirmed:
+            return (
+                *unchanged,
+                "⚠️ 先に「ゴミ箱へ移動することを確認しました」にチェックを入れてください。",
+            )
+
+        try:
+            ok, message = service.move_to_trash(job_id, kind)
+        except Exception:  # 設計書 §13.2
+            log.exception("ゴミ箱への移動に失敗しました: %s", key)
+            return (*unchanged, f"❌ ゴミ箱へ移動できませんでした{_LOG_HINT}")
+
+        if not ok:
+            # 失敗時は表示を変えない（消えたように見せない）
+            return (*unchanged, f"❌ {message}")
+
+        rows = _completed_rows()
+        return (
+            gr.update(value=None),                       # 選択解除
+            None,                                        # プレビューを消す
+            VIDEOS_EMPTY_NOTE,                           # メタを初期表示へ
+            "動画を選ぶと、ここに技術的な情報が出ます。",      # 「詳しい情報」も初期化
+            _videos_summary(rows),                       # 件数を更新
+            _clip_choices(),                             # 連結の追加候補を更新
+            gr.update(visible=False),                    # 整理セクションを隠す
+            gr.update(visible=False),                    # ゴミ箱ボタンを隠す
+            gr.update(value=False),                      # 確認チェックを戻す
+            message,
+        )
+
     # ------------------------------------------- ③指定順連結（P5.2・設計書 §23）
     #
     # 連結候補の並びは `gr.State(list[str])` に持つ＝**ブラウザセッションごと**。
@@ -2356,6 +2445,29 @@ def build_ui(
                         # ここが将来 [1080p高品質化] を足す場所（P6）。今は何も置かない
                         videos_msg_md = gr.Markdown("")
                         gr.Markdown(FINDER_NOTE, elem_classes=["h3-note"])
+
+                        # ---- P5.3-B: アプリ内ゴミ箱。**実在する動画を選んだ
+                        # ときだけ**現れる（記録だけの動画はそもそも一覧に出ない）
+                        with gr.Group(visible=False, elem_classes=["h3-panel"]) as trash_group:
+                            gr.Markdown("### この動画を整理する")
+                            gr.Markdown(
+                                f"動画は `data/{TRASH_DIR_LABEL}/` へ移動します。"
+                                "**アプリ上の復元機能はありません**"
+                                "（戻したいときは Finder で元のフォルダへ移してください）。"
+                                "この動画を使った既存の連結動画は消えません。",
+                                elem_classes=["h3-note"],
+                            )
+                            trash_ack = gr.Checkbox(
+                                value=False,
+                                label="この動画をアプリのゴミ箱へ移動することを確認しました",
+                            )
+                            trash_btn = gr.Button(
+                                TRASH_BUTTON_LABEL,
+                                variant="stop",
+                                visible=False,
+                                elem_classes=["h3-tap"],
+                            )
+
                         with gr.Accordion("詳しい情報（サポート用）", open=False):
                             video_tech_md = gr.Markdown(
                                 "動画を選ぶと、ここに技術的な情報が出ます。"
@@ -2739,6 +2851,31 @@ def build_ui(
             inputs=selected_video_state,
             outputs=[video_player3, video_meta_md, video_tech_md],
             api_name=False,
+        )
+        # P5.3-B: 整理セクションは**選択が変わったときだけ**出し入れする。
+        # Timer には一切載せない（1秒ごとに確認チェックが外れると使えないため）。
+        selected_video_state.change(
+            on_selection_changed_for_trash,
+            inputs=selected_video_state,
+            outputs=[trash_group, trash_btn, trash_ack],
+            api_name=False,
+        )
+        trash_btn.click(
+            on_move_to_trash,
+            inputs=[video_select, trash_ack],
+            outputs=[
+                video_select,
+                video_player3,
+                video_meta_md,
+                video_tech_md,
+                videos_summary_md,
+                custom_pick,
+                trash_group,
+                trash_btn,
+                trash_ack,
+                videos_msg_md,
+            ],
+            api_name="on_move_to_trash",
         )
         history_select.change(
             lambda key: str(key or ""),

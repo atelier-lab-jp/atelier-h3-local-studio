@@ -133,6 +133,14 @@ class AppConfig:
         return self.data_root / "concat_manifest.json"
 
     @property
+    def trash_dir(self) -> Path:
+        """アプリ内ゴミ箱（P5.3-B）。**HTTP 配信対象には入れない**。
+
+        実際に移動するときだけ作る（起動や一覧表示では作らない）。
+        """
+        return self.data_root / "trash"
+
+    @property
     def assets_mock_dir(self) -> Path:
         return self.project_root / "app" / "assets" / "mock"
 

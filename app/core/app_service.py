@@ -237,13 +237,16 @@ class VideoRow:
 
 @dataclass(frozen=True)
 class CompletedSummary:
-    """③完成・編集タブの要約（P5.3-A）。長い一覧表の代わりに件数だけを出す。"""
+    """③完成・編集タブの要約（P5.3-A）。長い一覧表の代わりに件数だけを出す。
+
+    数えるのは**実際にファイルがある動画だけ**（P5.3-B）。記録だけが残った動画は
+    そもそも一覧に出ないので、「欠損◯件」という欄は持たない。
+    """
 
     total: int
     clips: int
     chain_concats: int
     manual_concats: int
-    missing: int
 
     @property
     def concats(self) -> int:
@@ -311,6 +314,10 @@ class AppService:
         self._recent_submits: dict[str, tuple[float, JobView]] = {}
         # 任意順序連結の台帳（P5.2）。history.json とは独立したファイル（設計書 §23）
         self.concat_manifest = self._make_concat_manifest()
+        # ゴミ箱移動の直列化（P5.3-B）。二重クリックや別セッションの同時操作で
+        # 同じファイルを2回動かさないための**プロセス内の小さなロック**だけ持つ
+        # （永続的なロックや削除台帳は作らない。設計書 §25.4）
+        self._trash_lock = threading.Lock()
         # 連結サービス（P4/P5.2）。ffmpeg レーンは生成キューと別（設計書 §7 決定D5）
         self._concat = self._make_concat_service()
 
@@ -815,6 +822,11 @@ class AppService:
 
         3つの出どころを1つの表示用一覧へ合流させる唯一の場所（設計書 §23.3）。
         ここから下（UI）は VideoRow だけを見ればよく、記録先の違いを知らない。
+
+        **表示の正本はファイルの実在**（P5.3-B・設計書 §25.1）。動画ファイルが
+        無いものは、記録が残っていても完成動画として扱わない。Finder で消せば
+        次の更新で消え、正式パスへ戻せば次の更新でまた出る。除外リストのような
+        新しい永続データは持たない（＝ズレようがない）。
         """
         from app.core.contracts import JobStatus
 
@@ -826,6 +838,7 @@ class AppService:
             if rec.concat_path:
                 rows.append(self._row(rec, "concat"))
         rows.extend(self._manual_concat_rows())
+        rows = [r for r in rows if r.exists]
         # 出どころが混ざるので、合流後に必ず新しい順へ並べ直す
         rows.sort(
             key=lambda r: (r.created_at is not None, r.created_at, r.job_id),
@@ -837,19 +850,18 @@ class AppService:
         """③完成・編集タブの要約（P5.3-A）。長い一覧表の代わりに件数だけを出す。
 
         `completed_videos()` と**同じ行**を数えるので、画面の件数と選択候補が
-        食い違わない（別々に数え直すと必ずずれる）。
+        食い違わない（別々に数え直すと必ずずれる）。数えるのは**実在する動画だけ**
+        なので、欠損件数という概念そのものが無くなった（P5.3-B）。
         """
         rows = self.completed_videos()
         clips = sum(1 for r in rows if r.kind == "clip")
         chains = sum(1 for r in rows if r.concat_kind == "chain")
         manuals = sum(1 for r in rows if r.concat_kind == "manual")
-        missing = sum(1 for r in rows if not r.exists)
         return CompletedSummary(
             total=len(rows),
             clips=clips,
             chain_concats=chains,
             manual_concats=manuals,
-            missing=missing,
         )
 
     def concat_product_rows(self) -> list[VideoRow]:
@@ -870,12 +882,23 @@ class AppService:
         return [r for r in self.completed_videos() if r.kind == "clip"]
 
     def history_rows(self, status: str | None = None) -> list[VideoRow]:
-        """④履歴タブ用。全状態（QUEUED/RUNNING の残存も含む）を新しい順で返す。"""
+        """④履歴タブ用。全状態（QUEUED/RUNNING の残存も含む）を新しい順で返す。
+
+        **成功したジョブだけは動画の実在を条件にする**（P5.3-B・設計書 §25.1）。
+        成功と書いてあるのに再生できない行を残すと、ユーザーには「消したのに
+        まだ居る」としか見えないため。失敗・取消・中断・待機・実行中は
+        そもそも動画を持たない記録なので、これまでどおり必ず残す。
+        """
+        from app.core.contracts import JobStatus
+
         rows: list[VideoRow] = []
         for rec in self.history.list_records(newest_first=True):
             if status and rec.status.value != status:
                 continue
-            rows.append(self._row(rec, "clip"))
+            row = self._row(rec, "clip")
+            if rec.status is JobStatus.SUCCESS and not row.exists:
+                continue
+            rows.append(row)
         return rows
 
     def find_row(self, job_id: str, kind: str = "clip") -> VideoRow | None:
@@ -1012,6 +1035,90 @@ class AppService:
 
     def concat_status(self):
         return self._concat.status() if self._concat is not None else None
+
+    # ------------------------------------------------- P5.3-B: アプリ内ゴミ箱
+
+    def _busy_reason(self) -> str | None:
+        """生成・連結が動いていればその理由（**依存関係の検査ではない**）。
+
+        単純なファイル競合の回避（設計書 §25.4）。実行中のジョブが書き込む
+        かもしれないファイルを、同時に動かさないというだけの話。
+        """
+        try:
+            snapshot = self.snapshot()
+            if snapshot.current is not None:
+                return "動画の生成または連結が実行中です。完了してから整理してください。"
+        except Exception:  # pragma: no cover - スナップショットが取れない場合
+            log.exception("キューの状態を取得できませんでした")
+        try:
+            status = self.concat_status()
+            if status is not None and getattr(status, "running", False):
+                return "動画の生成または連結が実行中です。完了してから整理してください。"
+        except Exception:  # pragma: no cover
+            log.exception("連結の状態を取得できませんでした")
+        return None
+
+    def _trash_targets(self, row: VideoRow) -> list[Path]:
+        """この行に対して**移動してよいファイル**（他の動画には触れない）。
+
+        - 個別動画: 本体の MP4 と、あれば最終フレーム PNG
+        - 連結動画（チェーン・指定順とも）: 選ばれた連結 MP4 だけ
+
+        素材・親・子・他の連結成果物は**含めない**（連動削除はしない。§25.5）。
+        """
+        paths: list[Path] = []
+        if row.video_path is not None:
+            paths.append(row.video_path)
+        if row.kind == "clip":
+            record = self.history.get(row.job_id)
+            last_frame = (
+                self.history.to_absolute(record.last_frame_path) if record else None
+            )
+            if last_frame is not None and last_frame.is_file():
+                paths.append(last_frame)
+        return paths
+
+    def move_to_trash(self, job_id: str, kind: str = "clip") -> tuple[bool, str]:
+        """選ばれた動画を `data/trash/` へ移す（成功したか, 日本語メッセージ）。
+
+        受け取るのは**種別とID だけ**。パスはここでサーバ側のストアから引く
+        （ブラウザから来たパスは一切信用しない。設計書 §15・§25.3）。
+        """
+        from app.core.trash_service import TrashError, move_to_trash
+
+        kind = str(kind or "clip").strip()
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            return False, "整理する動画を選んでください。"
+        if kind not in ("clip", "concat"):
+            return False, f"整理できない種別です: {kind}"
+
+        with self._trash_lock:
+            busy = self._busy_reason()
+            if busy:
+                return False, busy
+
+            # 実行の直前にもう一度引き直す（別のセッションが先に消しているかもしれない）
+            row = self.find_row(job_id, kind)
+            if row is None or not row.exists or row.video_path is None:
+                return False, "動画はすでに移動されたか、見つかりません。"
+            if row.job_id != job_id:  # pragma: no cover - 解決結果の取り違え防止
+                return False, "動画はすでに移動されたか、見つかりません。"
+
+            try:
+                moved = move_to_trash(
+                    self._trash_targets(row), data_root=self.cfg.data_root
+                )
+            except TrashError as e:
+                log.warning("ゴミ箱へ移動できませんでした: %s:%s（%s）", kind, job_id, e)
+                return False, str(e)
+            except Exception as e:  # pragma: no cover - 想定外
+                log.exception("ゴミ箱への移動で予期しないエラー: %s:%s", kind, job_id)
+                return False, f"ゴミ箱へ移動できませんでした（{e}）"
+
+        names = "・".join(source.name for source, _ in moved)
+        log.info("ゴミ箱へ移動: %s:%s（%s）", kind, job_id, names)
+        return True, "✅ 動画をアプリのゴミ箱へ移動しました。"
 
     def reveal_in_finder(self, target, kind: str = "clip") -> str:
         """Finder で成果物を表示する（日本語メッセージを返す）。

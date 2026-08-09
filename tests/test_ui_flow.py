@@ -906,33 +906,33 @@ def test_completed_tab_shows_a_summary_instead_of_a_table(p4_app):
     assert "連結の状態" in concat_status
 
 
-def test_completed_summary_counts_each_kind_and_missing_files(p4_app):
-    """要約が「個別／連結の件数」と「ファイル欠損の件数」を正しく出す。"""
+def test_completed_summary_counts_only_existing_videos(p4_app):
+    """要約は**実際にファイルがある動画だけ**を数える（P5.3-B）。"""
     client, service, _cfg = p4_app
     summary = client.predict(api_name="/on_videos_tick")[0]
 
     rows = service.completed_videos()
+    assert rows and all(r.exists for r in rows)
     clips = sum(1 for r in rows if r.kind == "clip")
-    missing = sum(1 for r in rows if not r.exists)
 
     assert f"完成した動画: {len(rows)}件" in summary
     assert f"個別{clips}件" in summary
-    # p4 の固定データには成果物が消えた記録が含まれている
-    assert missing > 0
-    assert f"ファイル欠損 {missing}件" in summary
-    assert "次の工程で追加予定" in summary  # 整理機能は P5.3-B
+    # 欠損という概念そのものを画面から無くした
+    assert "欠損" not in summary
+    assert "次の工程で追加予定" not in summary
 
     got = service.completed_summary()
-    assert (got.total, got.clips, got.missing) == (len(rows), clips, missing)
+    assert (got.total, got.clips) == (len(rows), clips)
+    assert not hasattr(got, "missing"), "欠損件数の欄は持たない"
 
 
-def test_completed_summary_without_missing_files_has_no_warning(ui_app):
-    """欠損が0件のときは警告文を出さない（不安をあおらない）。"""
-    client, service = ui_app
+def test_completed_summary_never_warns_about_missing_files(ui_app):
+    """欠損の警告文はどの状態でも出さない（記録は静かに一覧から外れるだけ）。"""
+    client, _service = ui_app
     summary = client.predict(api_name="/on_videos_tick")[0]
-    if service.completed_summary().missing == 0:
-        assert "ファイル欠損" not in summary
-        assert "次の工程で追加予定" not in summary
+    assert "ファイル欠損" not in summary
+    assert "次の工程で追加予定" not in summary
+    assert "記録を片づける" not in summary
 
 
 def test_completed_tab_preview_and_metadata(p4_app):
@@ -971,15 +971,27 @@ def test_completed_tab_concat_row_shows_sources(p4_app):
     assert (cfg.concat_dir / "c_v_p4_child_2clips.mp4").is_file()
 
 
-def test_completed_tab_missing_artifact_is_safe(p4_app):
-    """成果物が消えていてもプレビューは None にして、日本語で欠損を伝える。"""
-    client, _service, _cfg = p4_app
-    listing = client.predict(api_name="/on_videos_tick")[0]
-    assert "ファイル欠損" in listing
+def test_completed_tab_hides_records_whose_file_is_gone(p4_app):
+    """ファイルが無い記録は③から**消える**（P5.3-B: 実在が表示の正本）。
 
+    以前は「⚠️ファイル欠損」として一覧に残していたが、ユーザーから見れば
+    Finder で消したのに居座っているだけなので、出さない方針へ変えた。
+    """
+    client, service, _cfg = p4_app
+    summary, choices, _concat, clip_choices = client.predict(api_name="/on_videos_tick")
+
+    assert "ファイル欠損" not in summary
+    assert "次の工程で追加予定" not in summary
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
+    assert "clip:v_p4_missing" not in values, "欠損記録が選択候補に残っています"
+    clip_values = [c[1] if isinstance(c, (list, tuple)) else c for c in clip_choices["choices"]]
+    assert "v_p4_missing" not in clip_values, "欠損記録が連結候補に残っています"
+    assert all(r.exists for r in service.completed_videos())
+
+    # 欠損IDを直接指定しても落ちず、日本語で理由が出る
     video, meta, _tech = client.predict("clip:v_p4_missing", api_name="/on_select_video")
     assert _video_path(video) is None
-    assert "ファイルが見つかりません" in meta
+    assert "見つかりません" in meta
 
     # 存在しないIDを選んでも落ちない
     video, meta, _tech = client.predict("clip:v_no_such_id", api_name="/on_select_video")
@@ -1871,24 +1883,34 @@ def test_history_concat_products_keep_source_order(p4_app):
     assert "v_p4_root → v_p4_child" in chain_row
 
 
-def test_history_concat_products_show_missing_files(p4_app, tmp_path):
-    """成果物が消えた連結記録は「見つかりません」と分かる（勝手に消さない）。"""
+def test_history_concat_products_hide_missing_files(p4_app, tmp_path):
+    """成果物が消えた連結記録は④からも消える。**戻せば再表示される**（P5.3-B）。
+
+    台帳のエントリは残したまま、表示だけがファイルの実在に追従する。
+    """
     client, service, cfg = p4_app
     service.start_custom_concat(["v_p4_root", "v_p4_child"])
     status = _wait_concat(service)
     assert status.state == "done", status.message
+    entries_before = len(service.concat_manifest.list_entries())
+
+    table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+    assert status.concat_id in table  # まずは出ている
 
     # Finder で消した状況を再現する（記録だけが残る）
     status.output_path.rename(tmp_path / status.output_path.name)
-    try:
-        table, _ = client.predict("連結成果物", api_name="/on_history_filter")
-        assert status.concat_id in table
-        assert "見つかりません" in table
-        # ③の要約にも欠損として数えられる
-        summary = client.predict(api_name="/on_videos_tick")[0]
-        assert "ファイル欠損" in summary
-    finally:
-        (tmp_path / status.output_path.name).rename(status.output_path)
+    table, choices = client.predict("連結成果物", api_name="/on_history_filter")
+    assert status.concat_id not in table, "欠損した連結が④に残っています"
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
+    assert f"concat:{status.concat_id}" not in values
+    assert "ファイル欠損" not in client.predict(api_name="/on_videos_tick")[0]
+    # 台帳のエントリ自体は消していない（内部記録は残す）
+    assert len(service.concat_manifest.list_entries()) == entries_before
+
+    # 正式パスへ戻すと、追加の操作なしで再表示される
+    (tmp_path / status.output_path.name).rename(status.output_path)
+    table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+    assert status.concat_id in table
 
 
 def test_history_concat_product_preview_and_reveal(p4_app):
@@ -1957,3 +1979,135 @@ def test_concat_order_body_and_total_are_rendered_separately(p4_app):
     assert "現在の連結順: 1本" in total
     assert "あと1本で連結できます" in total
     assert "現在の連結順" not in body  # 合計は本文に混ざらない
+
+
+# ------------------------------ P5.3-B アプリ内ゴミ箱（HTTP 経由の通し確認）
+
+from app.ui.minimal import VIDEOS_EMPTY_NOTE as VIDEOS_EMPTY_NOTE_TEXT  # noqa: E402
+
+
+def _seed_extra_success(cfg, history, job_id: str):
+    """整理して消してよい成功動画を1本足す（他の固定データを壊さない）。"""
+    shutil.copyfile(MOCK_ASSET_MP4, cfg.outputs_dir / f"{job_id}.mp4")
+    shutil.copyfile(MOCK_ASSET_PNG, cfg.outputs_dir / f"{job_id}_last.png")
+    history.add(
+        _p4_record(
+            cfg,
+            id=job_id,
+            output_path=f"outputs/{job_id}.mp4",
+            last_frame_path=f"outputs/{job_id}_last.png",
+        )
+    )
+
+
+def _trash(client, key: str, confirmed: bool):
+    """`/on_move_to_trash` を呼び、（要約, メッセージ）を返す。
+
+    gr.update の dict も混ざるので、位置ではなく型で拾う。
+    """
+    result = client.predict(key, confirmed, api_name="/on_move_to_trash")
+    return result, str(result[-1])
+
+
+def test_trash_requires_the_confirmation_checkbox(p4_app):
+    """チェックが無いまま押しても、ファイルは動かさず日本語で促す。"""
+    client, service, cfg = p4_app
+    target = cfg.outputs_dir / "v_p4_root.mp4"
+    assert target.is_file()
+
+    _result, message = _trash(client, "clip:v_p4_root", False)
+    assert "チェックを入れてください" in message
+    assert target.is_file(), "確認前にファイルが動きました"
+    assert not (cfg.data_root / "trash").exists()
+
+
+def test_trash_without_a_selection_is_refused(p4_app):
+    client, _service, _cfg = p4_app
+    _result, message = _trash(client, "", True)
+    assert "選んでください" in message
+
+
+def test_trash_moves_the_video_and_clears_the_screen(p4_app):
+    """成功したら、その応答で選択・プレビュー・確認チェックまで片づける。"""
+    client, service, cfg = p4_app
+    job_id = "v_p4_trash_me"
+    _seed_extra_success(cfg, service.history, job_id)
+
+    summary_before = client.predict(api_name="/on_videos_tick")[0]
+    assert job_id in [r.job_id for r in service.completed_videos()]
+
+    result, message = _trash(client, f"clip:{job_id}", True)
+    assert "ゴミ箱へ移動しました" in message
+
+    # ファイルは data/trash/ へ移り、正式パスからは消えている
+    assert not (cfg.outputs_dir / f"{job_id}.mp4").exists()
+    assert not (cfg.outputs_dir / f"{job_id}_last.png").exists()
+    moved = sorted(p.name for p in (cfg.data_root / "trash").iterdir())
+    assert moved == [f"{job_id}.mp4", f"{job_id}_last.png"]
+
+    # 画面の後片づけ（選択解除・プレビュー消去・確認チェック戻し）。
+    # HTTP 経由では Group とボタンの更新は返らないので、見えるのは8値
+    # （選択欄・プレビュー・メタ・詳しい情報・要約・連結候補・確認チェック・メッセージ）。
+    assert len(result) == 8, result
+    assert result[0]["value"] is None          # 選択欄を空にする
+    assert result[1] is None                   # プレビューを消す
+    assert VIDEOS_EMPTY_NOTE_TEXT in str(result[2])
+    assert "動画を選ぶと" in str(result[3])     # 「詳しい情報」も初期化
+    assert result[6]["value"] is False         # 確認チェックを戻す
+
+    # 件数と候補から消える
+    summary_after = str(result[4])
+    assert summary_after != summary_before
+    assert job_id not in [r.job_id for r in service.completed_videos()]
+    _listing, choices, _concat, clips = client.predict(api_name="/on_videos_tick")
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
+    assert f"clip:{job_id}" not in values
+    clip_values = [c[1] if isinstance(c, (list, tuple)) else c for c in clips["choices"]]
+    assert job_id not in clip_values
+
+
+def test_trash_removes_the_video_from_the_history_tab(p4_app):
+    client, service, cfg = p4_app
+    job_id = "v_p4_history_gone"
+    _seed_extra_success(cfg, service.history, job_id)
+    table, _ = client.predict("成功", api_name="/on_history_filter")
+    assert job_id in table
+
+    _result, message = _trash(client, f"clip:{job_id}", True)
+    assert "ゴミ箱へ移動しました" in message
+
+    table, _ = client.predict("成功", api_name="/on_history_filter")
+    assert job_id not in table
+    table, _ = client.predict("すべて", api_name="/on_history_filter")
+    assert job_id not in table
+
+
+def test_trashing_twice_reports_it_is_already_gone(p4_app):
+    client, service, cfg = p4_app
+    job_id = "v_p4_double_trash"
+    _seed_extra_success(cfg, service.history, job_id)
+
+    _result, first = _trash(client, f"clip:{job_id}", True)
+    assert "ゴミ箱へ移動しました" in first
+
+    _result, second = _trash(client, f"clip:{job_id}", True)
+    assert "すでに移動されたか、見つかりません" in second
+
+
+def test_trashing_a_source_keeps_the_existing_concat_playable(p4_app):
+    """素材を消しても、できている連結動画は残って再生できる（連動削除しない）。"""
+    client, service, cfg = p4_app
+    concat_file = cfg.concat_dir / "c_v_p4_child_2clips.mp4"
+    assert concat_file.is_file()
+    before = (concat_file.stat().st_size, concat_file.stat().st_mtime_ns)
+
+    _result, message = _trash(client, "clip:v_p4_root", True)
+    assert "ゴミ箱へ移動しました" in message
+
+    assert concat_file.is_file()
+    assert (concat_file.stat().st_size, concat_file.stat().st_mtime_ns) == before
+    video, meta, _tech = client.predict("concat:v_p4_child", api_name="/on_select_video")
+    assert _video_path(video) is not None
+    assert "連結元" in meta
+    # 子動画も残る
+    assert (cfg.outputs_dir / "v_p4_child.mp4").is_file()

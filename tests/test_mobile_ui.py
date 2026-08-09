@@ -1249,14 +1249,15 @@ def test_timer_still_never_touches_the_custom_concat_editing_state(offline_demo)
 
 
 def test_custom_concat_panel_has_its_own_class(ui_config):
-    """連結セクションが専用クラスのパネルになっている（Gradio 既定背景に任せない）。"""
-    panels = [
-        c for c in ui_config["components"] if "h3-panel" in _classes(c)
-    ]
-    assert len(panels) == 1, "順番指定連結のパネルが1つだけあるはず"
-    assert panels[0]["type"] == "group"
+    """連結セクションが専用クラスのパネルになっている（Gradio 既定背景に任せない）。
 
-    # パネルの中に連結の操作が入っている
+    P5.3-B で整理セクションにも同じパネル装飾を使うので、`.h3-panel` は2つある。
+    ここでは**連結の操作を含むほう**が正しくパネルになっていることを見る。
+    """
+    panels = [c for c in ui_config["components"] if "h3-panel" in _classes(c)]
+    assert len(panels) == 2, "連結パネルと整理パネルの2つがあるはず"
+    assert all(p["type"] == "group" for p in panels)
+
     parents = _parents(ui_config)
     add = _only(_by_value(ui_config, "button", CUSTOM_ADD_LABEL), "追加ボタン")
 
@@ -1267,7 +1268,12 @@ def test_custom_concat_panel_has_its_own_class(ui_config):
             seen.add(component_id)
         return seen
 
-    assert panels[0]["id"] in ancestors(add["id"])
+    concat_panels = [p for p in panels if p["id"] in ancestors(add["id"])]
+    assert len(concat_panels) == 1, "順番指定連結のパネルが特定できません"
+    # 連結パネルは常時表示、整理パネルは選択するまで隠れている
+    assert concat_panels[0]["props"].get("visible") is not False
+    other = [p for p in panels if p["id"] != concat_panels[0]["id"]][0]
+    assert other["props"].get("visible") is False
 
 
 def test_helper_buttons_are_outlined_and_not_the_primary(ui_config):
@@ -1405,3 +1411,102 @@ def test_appearance_change_does_not_touch_the_wiring(offline_demo):
     assert len(by_api["on_custom_add"].inputs) == 2   # State ＋ 候補ドロップダウン
     assert len(by_api["on_custom_clear"].inputs) == 1  # State だけ
     assert len(by_api["on_videos_tick"].outputs) == 4  # 契約は不変
+
+
+# ------------------------------- P5.3-B アプリ内ゴミ箱（③の整理セクション）
+
+
+def test_trash_section_is_hidden_until_a_video_is_selected(ui_config):
+    """整理セクションは**動画を選ぶまで隠れている**（誤操作を減らす）。"""
+    panels = [c for c in ui_config["components"] if "h3-panel" in _classes(c)]
+    hidden = [p for p in panels if p["props"].get("visible") is False]
+    assert len(hidden) == 1, "初期非表示の整理パネルが1つあるはず"
+
+    heading = _only(_by_value(ui_config, "markdown", "### この動画を整理する"), "見出し")
+    parents = _parents(ui_config)
+    assert parents[heading["id"]] == hidden[0]["id"]
+
+
+def test_trash_button_is_a_stop_variant_and_starts_hidden(ui_config):
+    """危険操作なので赤系（stop）。P5.3-A で温存しておいた色をここで使う。"""
+    button = _only(
+        [
+            b for b in _components(ui_config, "button")
+            if str(b["props"].get("value") or "").startswith("🗑 ゴミ箱へ移動")
+        ],
+        "ゴミ箱ボタン",
+    )
+    assert button["props"].get("variant") == "stop"
+    assert button["props"].get("visible") is False
+    assert "h3-tap" in _classes(button)  # iPhone の 44px タップ領域
+
+    # 連結の補助ボタンは赤系にしない（P5.3-A の約束を守れているか）
+    for text in (CUSTOM_UP_LABEL, CUSTOM_REMOVE_LABEL, CUSTOM_CLEAR_LABEL):
+        helper = _only(_by_value(ui_config, "button", text), text)
+        assert helper["props"].get("variant") != "stop"
+
+
+def test_trash_requires_an_explicit_confirmation_checkbox(ui_config):
+    """確認チェックが無いと押せない（ワーカー再起動と同じ形）。"""
+    checks = [
+        c for c in _components(ui_config, "checkbox")
+        if "ゴミ箱へ移動することを確認" in str(c["props"].get("label") or "")
+    ]
+    assert len(checks) == 1
+    assert checks[0]["props"].get("value") is False
+
+
+def test_trash_note_explains_where_files_go_and_no_restore(ui_config):
+    """移動先と「復元機能が無いこと」を先に伝える。"""
+    notes = [
+        str(c["props"].get("value") or "")
+        for c in _components(ui_config, "markdown")
+        if "h3-note" in _classes(c)
+    ]
+    note = next(n for n in notes if "ゴミ箱" in n or "trash" in n)
+    assert "data/trash/" in note
+    assert "復元機能はありません" in note
+    assert "連結動画は消えません" in note  # 連動削除しないことも伝える
+
+
+def test_trash_wiring_sends_only_the_selection_key(offline_demo):
+    """UI から渡すのは選択キーと確認チェックだけ（パスは渡さない）。"""
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    fn = by_api["on_move_to_trash"]
+
+    assert len(fn.inputs) == 2
+    assert "表示する動画を選ぶ" in str(getattr(fn.inputs[0], "label", ""))
+    assert type(fn.inputs[1]).__name__ == "Checkbox"
+    # 成功時にまとめて片づける先（選択・プレビュー・要約・候補・確認チェック）
+    assert len(fn.outputs) == 10
+
+
+def test_timer_does_not_touch_the_trash_controls(offline_demo):
+    """Timer が整理セクションを触らない（1秒ごとに確認チェックが外れない）。"""
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    tick = by_api["on_videos_tick"].outputs
+    assert len(tick) == 4  # P5.3-A の契約は維持
+
+    trash_controls = {id(o) for o in by_api["on_move_to_trash"].outputs
+                      if type(o).__name__ in ("Checkbox", "Group")}
+    assert not (trash_controls & {id(o) for o in tick})
+    # 編集中の連結順も従来どおり触らない
+    assert "State" not in {type(o).__name__ for o in tick}
+
+
+def test_no_restore_or_hidden_filter_ui_exists(ui_config):
+    """復元UI・非表示フィルタは作らない（簡易方式の確認）。"""
+    labels = [str(b["props"].get("value") or "") for b in _components(ui_config, "button")]
+    assert not any("復元" in v or "元に戻す" in v for v in labels)
+
+    radios = [
+        r for r in _components(ui_config, "radio")
+        if "状態フィルタ" in str(r["props"].get("label") or "")
+    ]
+    choices = [
+        c[0] if isinstance(c, (list, tuple)) else c for c in radios[0]["props"]["choices"]
+    ]
+    assert not any("ゴミ箱" in c or "非表示" in c for c in choices)
+    assert choices[-1] == "連結成果物"  # P5.3-A のまま
