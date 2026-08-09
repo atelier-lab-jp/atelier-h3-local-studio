@@ -259,6 +259,14 @@ FINDER_NOTE = (
     "「ビデオを保存」を選んでください。"
 )
 
+#: 未選択のときに③④の右側へ出す案内文。**選択欄の位置とボタン名がタブごとに違う**
+#: ため、共通化せず別々に持つ（P5.1: ③は選択欄を一覧の上へ移した）。
+VIDEOS_EMPTY_NOTE = (
+    "上の選択欄から動画を選び、［選んだ動画を表示］を押すと、"
+    "ここに詳細とプレビューが出ます。"
+)
+HISTORY_EMPTY_NOTE = "上の一覧から記録を選ぶと、ここに詳細が出ます。"
+
 # ------------------------------------------------------------------ P5 定数（§6.1）
 
 #: iPhone Safari 縦画面向けのスタイル。
@@ -1174,12 +1182,18 @@ def build_ui(
             )
         return "\n".join(lines)
 
-    def _preview_of(rows: list, key: str, *, with_status: bool) -> tuple:
-        """選択キーから（動画パス・詳細・「詳しい情報」）の3つを作る（P5 §6.4）。"""
+    def _preview_of(
+        rows: list, key: str, *, with_status: bool, empty_message: str
+    ) -> tuple:
+        """選択キーから（動画パス・詳細・「詳しい情報」）の3つを作る（P5 §6.4）。
+
+        未選択のときの案内文は③と④で異なる（選択欄の位置もボタン名も違う）ため、
+        呼び出し側から `empty_message` を受け取る。
+        """
         if not key:
             return (
                 None,
-                "上の一覧から動画を選ぶと、ここに詳細とプレビューが出ます。",
+                empty_message,
                 "動画を選ぶと、ここに技術的な情報が出ます。",
             )
         row = _find_row(rows, key)
@@ -1350,6 +1364,16 @@ def build_ui(
         base = (prompt or "").rstrip()
         return (base + "\n" + DIALOGUE_HINT).strip() if base else DIALOGUE_HINT
 
+    def on_clear_prompt():
+        """プロンプト欄だけを空にする（P5.1）。
+
+        **引数を取らず、戻り値も空文字1つだけ**にしてある。長さ・ステップ・
+        シード・継続モードはこの関数から見えないので、構造的に書き換えようがない。
+        投入済みのジョブ・履歴・完成動画にも触れない（サービス層を呼ばない）。
+        空欄で押しても空文字を返すだけで、例外にはならない。
+        """
+        return ""
+
     # ---------------------------------------------------- ②キュータブの callbacks
 
     def on_queue_tick():
@@ -1423,7 +1447,12 @@ def build_ui(
     def on_select_video(key):
         """選択された完成動画のプレビュー・詳細・「詳しい情報」（3値。P5 §6.4）。"""
         try:
-            return _preview_of(_completed_rows(), str(key or "").strip(), with_status=False)
+            return _preview_of(
+                _completed_rows(),
+                str(key or "").strip(),
+                with_status=False,
+                empty_message=VIDEOS_EMPTY_NOTE,
+            )
         except Exception:  # 設計書 §13.2
             log.exception("完成動画の詳細を取得できませんでした")
             return (
@@ -1664,7 +1693,12 @@ def build_ui(
         """選択された履歴レコードの詳細（3値。成功動画のみプレビューを出す）。"""
         try:
             rows = _history_rows(HISTORY_FILTERS.get(filter_label))
-            return _preview_of(rows, str(key or "").strip(), with_status=True)
+            return _preview_of(
+                rows,
+                str(key or "").strip(),
+                with_status=True,
+                empty_message=HISTORY_EMPTY_NOTE,
+            )
         except Exception:  # 設計書 §13.2
             log.exception("履歴の詳細を取得できませんでした")
             return (
@@ -1743,7 +1777,13 @@ def build_ui(
                             ),
                             lines=10,
                         )
-                        hint_btn = gr.Button("＋日本語セリフ記法を挿入", size="sm")
+                        # プロンプト欄の直下に補助ボタンを2つ並べる。どちらも
+                        # 主操作（生成をキューに追加）より小さい副ボタンにする。
+                        with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                            hint_btn = gr.Button("＋日本語セリフ記法を挿入", size="sm")
+                            clear_prompt_btn = gr.Button(
+                                "プロンプトを消去", size="sm", variant="secondary"
+                            )
 
                         length_radio = gr.Radio(
                             choices=list(LENGTH_CHOICES.keys()),
@@ -1866,9 +1906,9 @@ def build_ui(
                 initial_videos = _videos_view()
                 with gr.Row(elem_classes=["h3-row"]):
                     with gr.Column(scale=3):
-                        videos_list_md = gr.Markdown(
-                            initial_videos[0], elem_classes=["h3-scroll"]
-                        )
+                        # P5.1: 選ぶ操作を一覧より**上**に置く。一覧が伸びても
+                        # タブを開いた直後に操作できる（配置だけの変更で、
+                        # 選択・表示の機能そのものは P4 のまま）。
                         with gr.Row(elem_classes=["h3-row", "h3-tap"]):
                             video_select = gr.Dropdown(
                                 choices=[],
@@ -1880,13 +1920,14 @@ def build_ui(
                             video_reload_btn = gr.Button(
                                 "↻ 選んだ動画を表示", size="sm"
                             )
+                        videos_list_md = gr.Markdown(
+                            initial_videos[0], elem_classes=["h3-scroll"]
+                        )
                     with gr.Column(scale=2):
                         video_player3 = gr.Video(
                             label="プレビュー", interactive=False, autoplay=False
                         )
-                        video_meta_md = gr.Markdown(
-                            "上の一覧から動画を選ぶと、ここに詳細とプレビューが出ます。"
-                        )
+                        video_meta_md = gr.Markdown(VIDEOS_EMPTY_NOTE)
                         with gr.Row(elem_classes=["h3-row", "h3-tap"]):
                             video_continue_btn = gr.Button(
                                 "この動画の続きを作る", variant="primary"
@@ -1936,9 +1977,7 @@ def build_ui(
                             interactive=False,
                             autoplay=False,
                         )
-                        history_detail_md = gr.Markdown(
-                            "上の一覧から記録を選ぶと、ここに詳細が出ます。"
-                        )
+                        history_detail_md = gr.Markdown(HISTORY_EMPTY_NOTE)
                         with gr.Row(elem_classes=["h3-row", "h3-tap"]):
                             history_continue_btn = gr.Button("この動画の続きを作る")
                             history_concat_btn = gr.Button("ルートからここまでを連結")
@@ -1994,6 +2033,11 @@ def build_ui(
             api_name="on_submit",
         )
         hint_btn.click(on_insert_hint, inputs=prompt_box, outputs=prompt_box)
+        # 繰り返し使う操作なので確認は挟まない。**outputs はプロンプト欄だけ**に
+        # 限定してあるので、他の入力欄・キュー・履歴は書き換わらない。
+        clear_prompt_btn.click(
+            on_clear_prompt, outputs=prompt_box, api_name="on_clear_prompt"
+        )
         length_radio.change(
             on_estimate_change, inputs=[length_radio, step_radio], outputs=fixed_md
         )

@@ -306,6 +306,59 @@ def test_dialogue_hint_button_inserts_notation(ui_app):
     assert result.startswith("A wizard speaks.")
 
 
+# ------------------------------------------------- プロンプト消去ボタン（P5.1）
+
+
+def test_clear_prompt_button_returns_an_empty_prompt(ui_app):
+    """［プロンプトを消去］でプロンプト欄が空文字になる。"""
+    client, _ = ui_app
+    assert client.predict(api_name="/on_clear_prompt") == ""
+
+
+def test_clear_prompt_button_takes_no_input_and_writes_only_the_prompt(ui_app):
+    """消去できるのはプロンプト欄だけ（入力0・出力1）であることを API 契約で固定する。
+
+    長さ・ステップ・シードを渡す口が無く、書き戻す先も1つしかないので、
+    他の設定を巻き添えにしようがない。
+    """
+    client, _ = ui_app
+    endpoint = client.view_api(return_format="dict", print_info=False)[
+        "named_endpoints"
+    ]["/on_clear_prompt"]
+    assert endpoint["parameters"] == []
+    assert len(endpoint["returns"]) == 1
+
+
+def test_clear_prompt_on_an_empty_box_is_not_an_error(ui_app):
+    """空欄のまま何度押しても、例外にならず空文字が返る（確認ダイアログなし）。"""
+    client, _ = ui_app
+    assert [client.predict(api_name="/on_clear_prompt") for _ in range(3)] == ["", "", ""]
+
+
+def test_clear_prompt_leaves_other_settings_untouched(ui_app):
+    """消去の前後で、長さ・ステップの目安表示（＝他の入力の状態）が変わらない。"""
+    from app.ui.minimal import LENGTH_CHOICES, STEP_CHOICES
+
+    client, _ = ui_app
+    long8 = (list(LENGTH_CHOICES)[-1], list(STEP_CHOICES)[-1])
+    before = client.predict(*long8, api_name="/on_estimate_change")
+    client.predict(api_name="/on_clear_prompt")
+    assert client.predict(*long8, api_name="/on_estimate_change") == before
+
+
+def test_clear_prompt_does_not_touch_queued_jobs(ui_app):
+    """キューへ登録済みのジョブのプロンプトは、消去ボタンの影響を受けない。"""
+    client, service = ui_app
+    prompt = "消去ボタンの影響を受けないこと <d>[Japanese] のこして</d>"
+    _submit(client, prompt)
+    job_id = service.history.list_records()[0].id
+    assert service.history.get(job_id).prompt == prompt
+
+    client.predict(api_name="/on_clear_prompt")
+
+    assert service.history.get(job_id).prompt == prompt
+
+
 # ------------------------------------------------------------------ ②キュータブ（P3）
 
 

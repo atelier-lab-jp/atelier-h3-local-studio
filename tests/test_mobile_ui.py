@@ -33,13 +33,18 @@ from app.core.app_service import AppService, SubmitResult
 from app.core.config import load_config
 from app.ui.minimal import (
     FINDER_NOTE,
+    HISTORY_EMPTY_NOTE,
     MOBILE_BREAKPOINT_PX,
     MOBILE_CSS,
     STEP_CHOICES,
     SUBMIT_LABEL,
     SUBMIT_LABEL_BUSY,
+    VIDEOS_EMPTY_NOTE,
     build_ui,
 )
+
+#: 選択欄を一覧の上へ移す前の案内文（P5.1 で置き換えた。復活させない）
+OLD_VIDEOS_EMPTY_NOTE = "上の一覧から動画を選ぶと、ここに詳細とプレビューが出ます。"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -231,6 +236,58 @@ def _components(ui_config, type_name: str) -> list[dict]:
 
 def _classes(component: dict) -> list[str]:
     return list(component.get("props", {}).get("elem_classes") or [])
+
+
+def _display_order(ui_config) -> list[int]:
+    """レイアウト木を上から順にたどり、部品IDを**画面に出る順**で並べる。
+
+    Mac は Row の左から右、iPhone は 1カラムに畳まれて上から下。どちらも
+    この深さ優先の並びと一致するので、「一覧より上にあるか」をこれで判定できる。
+    """
+    order: list[int] = []
+
+    def walk(node: dict) -> None:
+        order.append(node["id"])
+        for child in node.get("children") or []:
+            walk(child)
+
+    walk(ui_config["layout"])
+    return order
+
+
+def _parents(ui_config) -> dict[int, int]:
+    """子IDから親IDを引く表（部品を包む Row のクラスを確かめるのに使う）。"""
+    parent: dict[int, int] = {}
+
+    def walk(node: dict) -> None:
+        for child in node.get("children") or []:
+            parent[child["id"]] = node["id"]
+            walk(child)
+
+    walk(ui_config["layout"])
+    return parent
+
+
+def _only(matches: list[dict], what: str) -> dict:
+    """ちょうど1つだけ見つかることを確かめる（＝複製していない）。"""
+    assert len(matches) == 1, f"{what} が {len(matches)} 個あります（1個であるべき）"
+    return matches[0]
+
+
+def _by_label(ui_config, type_name: str, text: str) -> list[dict]:
+    return [
+        c
+        for c in _components(ui_config, type_name)
+        if text in str(c.get("props", {}).get("label") or "")
+    ]
+
+
+def _by_value(ui_config, type_name: str, text: str) -> list[dict]:
+    return [
+        c
+        for c in _components(ui_config, type_name)
+        if str(c.get("props", {}).get("value") or "").startswith(text)
+    ]
 
 
 def test_every_row_stacks_into_one_column_on_narrow_screens(ui_config):
@@ -693,3 +750,143 @@ def test_double_tap_is_still_collapsed(mobile_app):
     )
     assert b.duplicate is True
     assert b.view.job_id == a.view.job_id
+
+
+# ------------------------------------------------------------------ P5.1 UI操作性
+
+
+def test_clear_prompt_button_sits_next_to_the_hint_button(ui_config):
+    """［プロンプトを消去］は［＋日本語セリフ記法を挿入］と同じ行に1つだけある。"""
+    clear = _only(_by_value(ui_config, "button", "プロンプトを消去"), "消去ボタン")
+    hint = _only(
+        _by_value(ui_config, "button", "＋日本語セリフ記法を挿入"), "セリフ記法ボタン"
+    )
+    parents = _parents(ui_config)
+    assert parents[clear["id"]] == parents[hint["id"]], "2つのボタンが同じ行にありません"
+
+    order = _display_order(ui_config)
+    prompt = _only(_by_label(ui_config, "textbox", "プロンプト（英語推奨"), "プロンプト欄")
+    assert order.index(prompt["id"]) < order.index(clear["id"]), "消去ボタンがプロンプト欄より上にあります"
+
+
+def test_clear_prompt_button_is_less_prominent_than_the_submit_button(ui_config):
+    """主操作（生成をキューに追加）だけが primary で、消去は副ボタンにとどめる。"""
+    clear = _only(_by_value(ui_config, "button", "プロンプトを消去"), "消去ボタン")
+    submit = _only(_by_value(ui_config, "button", SUBMIT_LABEL), "生成ボタン")
+    assert clear["props"].get("variant") == "secondary"
+    assert submit["props"].get("variant") == "primary"
+    assert clear["props"].get("size") == "sm"
+
+
+def test_clear_prompt_button_keeps_a_44px_tap_target(ui_config):
+    """iPhone の 44px タップ領域を守る行（h3-tap）に入っている。"""
+    clear = _only(_by_value(ui_config, "button", "プロンプトを消去"), "消去ボタン")
+    row = {c["id"]: c for c in ui_config["components"]}[_parents(ui_config)[clear["id"]]]
+    assert "h3-tap" in _classes(row) and "h3-row" in _classes(row)
+
+    _outside, inside = _split_css(MOBILE_CSS)
+    assert ".h3-tap button" in inside and "min-height: 44px !important" in inside
+
+
+def test_clear_prompt_never_writes_to_anything_but_the_prompt(offline_demo):
+    """配線の出力先がプロンプト欄1つだけ（他の入力・一覧・履歴に触れない）。"""
+    _cfg, _service, demo = offline_demo
+    fn = {f.api_name: f for f in demo.fns.values()}["on_clear_prompt"]
+    assert fn.inputs == []
+    assert len(fn.outputs) == 1
+    assert "プロンプト（英語推奨" in str(fn.outputs[0].label)
+
+
+def test_video_selector_is_shown_above_the_list_on_the_completed_tab(ui_config):
+    """③完成動画タブ: 選択欄と［選んだ動画を表示］が一覧の見出しより上に1組だけある。"""
+    select = _only(
+        _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "選択欄"
+    )
+    reload_btn = _only(_by_value(ui_config, "button", "↻ 選んだ動画を表示"), "表示ボタン")
+    listing = _only(_by_value(ui_config, "markdown", "### 完成した動画"), "完成動画の一覧")
+
+    order = _display_order(ui_config)
+    assert order.index(select["id"]) < order.index(listing["id"]), "選択欄が一覧より下にあります"
+    assert order.index(reload_btn["id"]) < order.index(listing["id"]), "表示ボタンが一覧より下にあります"
+
+
+def test_video_selector_row_keeps_one_column_and_44px_on_iphone(ui_config):
+    """移動後も 1カラム化（h3-row）と 44px タップ領域（h3-tap）を保つ。"""
+    reload_btn = _only(_by_value(ui_config, "button", "↻ 選んだ動画を表示"), "表示ボタン")
+    by_id = {c["id"]: c for c in ui_config["components"]}
+    row = by_id[_parents(ui_config)[reload_btn["id"]]]
+    assert {"h3-row", "h3-tap"} <= set(_classes(row))
+
+
+def test_completed_tab_still_wires_select_reload_and_actions(offline_demo):
+    """配置換えで既存の選択・表示・継続・連結・Finder の配線が外れていない。"""
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    select = by_api["on_videos_tick"].outputs[1]
+    for api_name in (
+        "on_select_video",
+        "on_start_concat",
+        "on_reveal_video",
+        "on_start_continuation",
+    ):
+        assert by_api[api_name].inputs == [select], f"{api_name} の入力が選択欄ではありません"
+    # Timer の出力順（一覧・選択欄・連結状態）は配置換えの影響を受けない
+    assert "h3-scroll" in list(by_api["on_videos_tick"].outputs[0].elem_classes or [])
+
+
+def test_completed_tab_guidance_matches_the_new_selector_position(ui_config, mobile_app):
+    """③の案内文が「上の選択欄から選び、表示ボタンを押す」に更新されている（P5.1）。
+
+    起動直後の表示と、選択を空にしたときの案内の**両方**を見る。
+    どちらか一方だけ直すと、選択を外した瞬間に古い文言が戻ってしまう。
+    """
+    client, _svc, _demo, _port = mobile_app
+
+    assert VIDEOS_EMPTY_NOTE == (
+        "上の選択欄から動画を選び、［選んだ動画を表示］を押すと、"
+        "ここに詳細とプレビューが出ます。"
+    )
+    initial = [
+        c
+        for c in _components(ui_config, "markdown")
+        if str(c.get("props", {}).get("value") or "") == VIDEOS_EMPTY_NOTE
+    ]
+    assert len(initial) == 1, "③の初期案内文が見つからない（または重複している）"
+
+    _video, meta, _tech = client.predict("", api_name="/on_select_video")
+    assert meta == VIDEOS_EMPTY_NOTE, "選択を空にすると案内文が古いものへ戻る"
+
+
+def test_old_completed_tab_guidance_is_gone_everywhere(ui_config, mobile_app):
+    """古い案内文が、画面にもコールバックの戻り値にも残っていない（P5.1）。"""
+    client, _svc, _demo, _port = mobile_app
+
+    source = (PROJECT_ROOT / "app" / "ui" / "minimal.py").read_text(encoding="utf-8")
+    assert OLD_VIDEOS_EMPTY_NOTE not in source, "古い案内文がソースに残っています"
+
+    values = [
+        str(c.get("props", {}).get("value") or "") for c in ui_config["components"]
+    ]
+    assert OLD_VIDEOS_EMPTY_NOTE not in values
+
+    for api_name, args in (("/on_select_video", ("",)), ("/on_select_history", ("", "すべて"))):
+        _video, meta, _tech = client.predict(*args, api_name=api_name)
+        assert meta != OLD_VIDEOS_EMPTY_NOTE, api_name
+
+
+def test_history_tab_keeps_its_own_guidance(ui_config, mobile_app):
+    """④は選択欄が一覧の下のままなので、③の文言を流用しない（P5.1）。
+
+    案内文を1つに共通化すると、④で「上の選択欄から」という誤った案内になる。
+    """
+    client, _svc, _demo, _port = mobile_app
+
+    assert "選択欄" not in HISTORY_EMPTY_NOTE
+    assert HISTORY_EMPTY_NOTE != VIDEOS_EMPTY_NOTE
+
+    _video, detail, _tech = client.predict("", "すべて", api_name="/on_select_history")
+    assert detail == HISTORY_EMPTY_NOTE
+
+    # ④のボタン名は「記録」。③の「選んだ動画を表示」を案内してはいけない
+    history_btn = _only(_by_value(ui_config, "button", "↻ 選んだ記録を表示"), "履歴の表示ボタン")
+    assert history_btn is not None
