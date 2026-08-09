@@ -878,29 +878,61 @@ def _video_path(result) -> str | None:
 # ------------------------------------------------------------ ③完成動画タブ
 
 
-def test_completed_tab_lists_clips_and_concat(p4_app):
-    """③の一覧に成功した個別動画と連結動画が新しい順で並ぶ（失敗記録は出ない）。
+def test_completed_tab_shows_a_summary_instead_of_a_table(p4_app):
+    """③の先頭は**一覧表ではなく要約**（P5.3-A）。
 
-    P5.2 で `/on_videos_tick` の戻り値は 3→**4**（末尾に指定順連結の候補を追加）。
-    既存3つの順番と意味は変えていない。
+    `/on_videos_tick` の戻り値は P5.2 と同じ**4つ・同じ順番**のまま、
+    先頭の意味だけを「全動画の表」→「短い要約」へ変えた（設計書 §24.4）。
+    表は④履歴タブへ一本化した。
     """
     client, _service, _cfg = p4_app
-    listing, choices, concat_status, clip_choices = client.predict(
+    summary, choices, concat_status, clip_choices = client.predict(
         api_name="/on_videos_tick"
     )
 
-    assert "完成した動画" in listing
-    assert "v_p4_root" in listing and "v_p4_child" in listing
-    assert "個別" in listing and "連結" in listing  # 種別が分かる
-    assert "v_p4_failed" not in listing  # 失敗は③に出さない
-    assert "v_p4_canceled" not in listing
-    # 新しい順（child 10:10 が root 10:00 より前に出る）
-    assert listing.index("v_p4_child") < listing.index("v_p4_root")
-    # 選択候補には個別・連結の両方が入る
+    # 件数の要約であること（表の行や列見出しが無い）
+    assert "完成した動画" in summary
+    assert "|---" not in summary, "③に表が残っています"
+    assert "| 種別 |" not in summary
+    assert "一覧は「履歴」タブ" in summary
+    # 表そのものを出さないので、個々のジョブIDは並ばない
+    assert "v_p4_failed" not in summary and "v_p4_canceled" not in summary
+
+    # 選択候補は従来どおり（個別・連結の両方＋新しい順）
     values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
     assert "clip:v_p4_root" in values
     assert "concat:v_p4_child" in values
+    assert values.index("clip:v_p4_child") < values.index("clip:v_p4_root")
     assert "連結の状態" in concat_status
+
+
+def test_completed_summary_counts_each_kind_and_missing_files(p4_app):
+    """要約が「個別／連結の件数」と「ファイル欠損の件数」を正しく出す。"""
+    client, service, _cfg = p4_app
+    summary = client.predict(api_name="/on_videos_tick")[0]
+
+    rows = service.completed_videos()
+    clips = sum(1 for r in rows if r.kind == "clip")
+    missing = sum(1 for r in rows if not r.exists)
+
+    assert f"完成した動画: {len(rows)}件" in summary
+    assert f"個別{clips}件" in summary
+    # p4 の固定データには成果物が消えた記録が含まれている
+    assert missing > 0
+    assert f"ファイル欠損 {missing}件" in summary
+    assert "次の工程で追加予定" in summary  # 整理機能は P5.3-B
+
+    got = service.completed_summary()
+    assert (got.total, got.clips, got.missing) == (len(rows), clips, missing)
+
+
+def test_completed_summary_without_missing_files_has_no_warning(ui_app):
+    """欠損が0件のときは警告文を出さない（不安をあおらない）。"""
+    client, service = ui_app
+    summary = client.predict(api_name="/on_videos_tick")[0]
+    if service.completed_summary().missing == 0:
+        assert "ファイル欠損" not in summary
+        assert "次の工程で追加予定" not in summary
 
 
 def test_completed_tab_preview_and_metadata(p4_app):
@@ -966,12 +998,12 @@ def test_completed_tab_tick_recovers_after_exception(p4_app, monkeypatch):
     if hasattr(service, "completed_videos"):
         monkeypatch.setattr(service, "completed_videos", boom)
     broken = client.predict(api_name="/on_videos_tick")
-    assert "一覧を取得できません" in broken[0]
+    assert "取得できません" in broken[0]
 
     monkeypatch.undo()
     recovered = client.predict(api_name="/on_videos_tick")
-    assert "v_p4_root" in recovered[0]
-    assert "一覧を取得できません" not in recovered[0]
+    assert "完成した動画" in recovered[0]  # P5.3-A: 表ではなく要約が戻る
+    assert "取得できません" not in recovered[0]
 
 
 def test_preview_is_not_reset_by_timer_ticks(p4_app):
@@ -1698,8 +1730,9 @@ def test_custom_concat_appears_in_the_completed_list(p4_app):
     assert status.sources == ("v_p4_child", "v_p4_root")  # 指定順のまま
     concat_id = status.concat_id
 
-    listing, choices, _concat, _clips = client.predict(api_name="/on_videos_tick")
-    assert concat_id in listing
+    summary, choices, _concat, _clips = client.predict(api_name="/on_videos_tick")
+    # P5.3-A: ③は表ではなく要約。件数に数えられ、選択候補には必ず載る
+    assert "指定順連結1件" in summary
     values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
     assert f"concat:{concat_id}" in values
 
@@ -1709,6 +1742,16 @@ def test_custom_concat_appears_in_the_completed_list(p4_app):
 
     reveal = client.predict(f"concat:{concat_id}", api_name="/on_reveal_video")
     assert "見つかりません" not in reveal
+
+    # ④履歴タブの「連結成果物」フィルタから表で確認できる
+    table, hist_choices = client.predict("連結成果物", api_name="/on_history_filter")
+    assert concat_id in table
+    assert "指定順連結" in table
+    assert "v_p4_child → v_p4_root" in table  # sources の順番が分かる
+    hist_values = [
+        c[1] if isinstance(c, (list, tuple)) else c for c in hist_choices["choices"]
+    ]
+    assert f"concat:{concat_id}" in hist_values
 
 
 def test_custom_concat_candidates_exclude_concat_products(p4_app):
@@ -1763,3 +1806,154 @@ def test_manual_concat_row_hides_seed_and_steps(p4_app):
     # 個別動画・チェーン連結の表示は従来どおり
     clip = service.find_row("v_p4_root", "clip")
     assert _seed_cell(clip) != "—"
+
+
+# ------------------------- P5.3-A ④履歴タブの「連結成果物」フィルタ・任意連結UI
+
+
+def test_history_existing_filters_are_not_regressed(p4_app):
+    """既存7フィルタの意味と動作が変わらない（P5.3-A で追加しただけ）。"""
+    client, _service, _cfg = p4_app
+    for label, expect_id in (
+        ("すべて", "v_p4_root"),
+        ("成功", "v_p4_root"),
+        ("失敗", "v_p4_failed"),
+    ):
+        table, _choices = client.predict(label, api_name="/on_history_filter")
+        assert f"履歴（{label}" in table
+        assert expect_id in table
+    # 状態で絞ったときに連結成果物が混ざらない
+    success_table, _ = client.predict("成功", api_name="/on_history_filter")
+    assert "| 状態 | 種別 | 日時 | ID |" in success_table  # 従来の列構成
+    assert "指定順連結" not in success_table
+
+
+def test_history_concat_products_filter_lists_both_kinds(p4_app):
+    """「連結成果物」でチェーン連結と指定順連結の両方が新しい順に並ぶ。"""
+    client, service, _cfg = p4_app
+    service.start_custom_concat(["v_p4_root", "v_p4_child"])
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+
+    table, choices = client.predict("連結成果物", api_name="/on_history_filter")
+    assert "履歴（連結成果物" in table
+    # 連結成果物向けの列（step / seed / 状態は出さない）
+    assert "| 種類 | ID | 作成日時 | 長さ | 本数 | 元の動画（順番どおり） | ファイル |" in table
+    assert "seed" not in table and "ステップ" not in table
+    # チェーン連結（P4 の固定データ）と指定順連結の両方
+    assert "チェーン連結" in table and "指定順連結" in table
+    assert status.concat_id in table and "v_p4_child" in table
+    # 新しい順（いま作った指定順連結が先頭側）
+    assert table.index(status.concat_id) < table.index("チェーン連結")
+    # 個別動画は出ない
+    assert "| 個別 |" not in table
+
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
+    assert all(v.startswith("concat:") for v in values), values
+
+
+def test_history_concat_products_keep_source_order(p4_app):
+    """sources の順番が表にそのまま出る（並べ替えない）。"""
+    client, service, _cfg = p4_app
+    service.start_custom_concat(["v_p4_child", "v_p4_root"])
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+
+    table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+    row = next(line for line in table.splitlines() if status.concat_id in line)
+    assert "v_p4_child → v_p4_root" in row, row
+    assert "v_p4_root → v_p4_child" not in row
+    # 既存のチェーン連結の行は自分の順番のまま（取り違えていない）
+    chain_row = next(
+        line for line in table.splitlines()
+        if "チェーン連結" in line and status.concat_id not in line
+    )
+    assert "v_p4_root → v_p4_child" in chain_row
+
+
+def test_history_concat_products_show_missing_files(p4_app, tmp_path):
+    """成果物が消えた連結記録は「見つかりません」と分かる（勝手に消さない）。"""
+    client, service, cfg = p4_app
+    service.start_custom_concat(["v_p4_root", "v_p4_child"])
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+
+    # Finder で消した状況を再現する（記録だけが残る）
+    status.output_path.rename(tmp_path / status.output_path.name)
+    try:
+        table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+        assert status.concat_id in table
+        assert "見つかりません" in table
+        # ③の要約にも欠損として数えられる
+        summary = client.predict(api_name="/on_videos_tick")[0]
+        assert "ファイル欠損" in summary
+    finally:
+        (tmp_path / status.output_path.name).rename(status.output_path)
+
+
+def test_history_concat_product_preview_and_reveal(p4_app):
+    """④から連結成果物のプレビュー・Finder 表示ができる。"""
+    client, service, _cfg = p4_app
+    service.start_custom_concat(["v_p4_root", "v_p4_child"])
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+
+    video, detail, _tech = client.predict(
+        f"concat:{status.concat_id}", "連結成果物", api_name="/on_select_history"
+    )
+    assert _video_path(video) is not None
+    assert status.concat_id in detail and "連結元" in detail
+
+    reveal = client.predict(f"concat:{status.concat_id}", api_name="/on_history_reveal")
+    assert "見つかりません" not in reveal
+
+
+def test_custom_concat_total_is_separate_from_the_list(p4_app):
+    """合計表示が本文と分かれて返る（スクロール領域の外に出すため）。"""
+    from app.ui.minimal import MIN_CUSTOM_CLIPS
+
+    client, _service, _cfg = p4_app
+    # HTTP 経由では gr.State とボタンの更新は返らないので、
+    # 見えるのは（本文・対象欄・メッセージ・合計）の4つになる
+    result = client.predict(api_name="/on_custom_clear")
+    assert len(result) == 4, result
+    body, total = str(result[0]), str(result[3])
+    assert "まだ選ばれていません" in body
+    assert "現在の連結順: 0本" in total
+    assert f"{MIN_CUSTOM_CLIPS}本以上" in total
+    # 合計は本文に混ざらない（混ざると20本選んだとき読めなくなる）
+    assert "合計" not in body
+
+
+def test_concat_order_accepts_twenty_clips(p4_app):
+    """20本まで積める（表示は局所スクロールなのでページは伸びない）。
+
+    並びは `gr.State` にあり HTTP からは注入できないため、ここでは純粋関数で
+    20本を組み立てて上限の挙動を確かめる。`.h3-vscroll` が実際に適用されて
+    いることは `test_mobile_ui.py` の構造試験と実描画確認で担保している。
+    """
+    from app.ui.minimal import MAX_CUSTOM_CLIPS, custom_order_add
+
+    ids = [f"v_2026080{i // 10}_1200{i % 10:02d}_z{i:03d}" for i in range(21)]
+    known = set(ids)
+    order: list[str] = []
+    for job_id in ids[:MAX_CUSTOM_CLIPS]:
+        order, message = custom_order_add(order, job_id, known)
+        assert "追加しました" in message
+    assert len(order) == MAX_CUSTOM_CLIPS == 20
+    assert order == ids[:20], "積んだ順番が保たれていません"
+
+    over, message = custom_order_add(order, ids[20], known)
+    assert over == order and "20 本まで" in message
+
+
+def test_concat_order_body_and_total_are_rendered_separately(p4_app):
+    """本文（番号付き）と合計が別々の出力になっている（P5.3-A）。"""
+    client, _service, _cfg = p4_app
+    # 1本追加した直後の状態を HTTP で作る（State の既定は空リスト）
+    result = client.predict("v_p4_root", api_name="/on_custom_add")
+    body, total = str(result[0]), str(result[3])
+    assert "1. `v_p4_root`" in body
+    assert "現在の連結順: 1本" in total
+    assert "あと1本で連結できます" in total
+    assert "現在の連結順" not in body  # 合計は本文に混ざらない

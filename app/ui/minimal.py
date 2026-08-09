@@ -215,8 +215,22 @@ _DISK_LABELS = {
 #: 成果物の種別ラベル（③完成動画・④履歴の一覧で個別と連結を見分ける）
 KIND_LABELS = {"clip": "個別", "concat": "連結"}
 
+#: 連結成果物の作り方の別（P5.3-A）。④の「連結成果物」フィルタで区別して見せる。
+CONCAT_KIND_LABELS = {"chain": "チェーン連結", "manual": "指定順連結", None: "連結"}
+
+#: ③タブの表示名（P5.3-A で「完成動画」から改称）。**内部IDは `tab_videos` のまま**。
+#: 一覧表を④へ移し、③は「選ぶ・見る・つなげる」作業画面になったため。
+VIDEOS_TAB_LABEL = "完成・編集"
+
+#: 「連結成果物」フィルタの内部値（P5.3-A）。JobStatus のどの値とも重ならない
+#: 番兵にしてある（状態で絞る既存の経路へ紛れ込ませないため）。
+CONCAT_PRODUCTS_FILTER = "連結成果物"
+CONCAT_PRODUCTS_SENTINEL = "__concat_products__"
+
 #: ④履歴の状態フィルタ。`history_rows(status=...)` へ渡す値（すべて＝None）。
 #: QUEUED / RUNNING は正常終了後には残らないが、異常データを隠さないため選択肢に残す。
+#: 末尾の「連結成果物」だけは状態ではなく**種類**で絞る（P5.3-A。③から一覧表を
+#: 無くしたので、連結した動画を表で見られる唯一の場所になる）。
 HISTORY_FILTERS: dict[str, str | None] = {
     "すべて": None,
     "成功": "success",
@@ -225,6 +239,7 @@ HISTORY_FILTERS: dict[str, str | None] = {
     "中断": "interrupted",
     "実行待ち": "queued",
     "実行中": "running",
+    CONCAT_PRODUCTS_FILTER: CONCAT_PRODUCTS_SENTINEL,
 }
 
 #: 連結の進行状態（`concat_service.ConcatStatus.state`）→ 日本語。
@@ -265,6 +280,15 @@ MIN_CUSTOM_CLIPS = 2
 MAX_CUSTOM_CLIPS = 20
 CUSTOM_CONCAT_TITLE = "複数の動画を選んで連結（順番指定）"
 CUSTOM_CONCAT_LABEL = "▶ この順番で連結（2本以上選んでください）"
+
+#: 順番指定連結の補助操作（P5.3-A 仕上げ）。
+#: 「削除」はファイルを消す操作と紛らわしいので**「候補から外す」**にした。
+#: 実際に消えるのは、この画面で組み立てている**順番だけ**である。
+CUSTOM_ADD_LABEL = "＋ 連結候補へ追加"
+CUSTOM_UP_LABEL = "↑ 1つ上へ"
+CUSTOM_DOWN_LABEL = "↓ 1つ下へ"
+CUSTOM_REMOVE_LABEL = "－ 候補から外す"
+CUSTOM_CLEAR_LABEL = "連結候補をすべて解除"
 
 
 # --------------------------------------------- 指定順連結の並び操作（純粋関数）
@@ -358,7 +382,63 @@ MOBILE_CSS = f"""
 /* ---- 共通（Mac・iPhone の両方に効く。既存レイアウトは変えない） ---- */
 .h3-scroll {{ overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }}
 .h3-scroll table {{ margin: 0; }}
+/* 連結候補の一覧だけを縦スクロールにする（P5.3-A）。20本選んでもページ全体は
+   伸びず、2〜5本のときは中身の高さのままなので余分な空白も出ない。
+   横は広げない（`overflow-x` を触らないので横スクロールは発生しない）。 */
+.h3-vscroll {{
+  max-height: 14em; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+}}
 .h3-note {{ font-size: 0.92em; line-height: 1.6; opacity: 0.9; }}
+/* ---- 順番指定連結のパネルと補助ボタン（P5.3-A 仕上げ） ----
+   Gradio の Group 既定背景は薄い灰色で、secondary ボタンの灰色とほとんど同じに
+   なるため、補助操作が「押せるもの」に見えなかった。パネルを白くしてボタンを
+   白＋枠線のアウトライン型にし、境界をはっきりさせる。
+   **すべて `.h3-` 付きの選択子だけ**で書く（グローバルな button 指定はしない）。
+   クラスが button 自身に付く場合と包み要素に付く場合の両方へ効かせる。 */
+/* パネルは**わずかにオフホワイト**にして、白いボタンとの差を背景でも作る
+   （枠線が主役だが、背景も同一にしないことで同化の再発を防ぐ） */
+.h3-panel {{
+  background: #fcfcfd; border: 1px solid #d0d5dd; border-radius: 10px;
+  padding: 12px 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}}
+/* Gradio が内側の器（`.styler` / `.form`）へ独自の灰色を敷くため、パネルの中だけ
+   透過させて上の背景を見せる。**`.h3-panel` の下に限定**しているので他画面には
+   影響しない（入力欄そのものの背景は触らない）。 */
+.h3-panel > .styler, .h3-panel .form {{ background: transparent !important; }}
+.h3-btn, .h3-btn button {{
+  background: #ffffff !important; border: 1px solid #98a2b3 !important;
+  color: #1d2939 !important; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06) !important;
+}}
+.h3-btn:hover:not(:disabled), .h3-btn button:hover:not(:disabled) {{
+  background: #f2f4f7 !important; border-color: #475467 !important;
+}}
+.h3-btn:focus-visible, .h3-btn button:focus-visible {{
+  outline: 2px solid #1570ef !important; outline-offset: 2px !important;
+}}
+/* 無効時（現在この画面のボタンは無効にならないが、将来 `interactive=False` を
+   使う場合に備えて定義しておく）。`cursor` は効くが**色は Gradio 6.22.0 の
+   ボタン CSS が優先**するため、色の変化は保証しない（クラスを重ねて優先度を
+   上げても同様だった。到達しない状態なので実害はない）。 */
+.h3-btn.h3-btn:disabled, .h3-btn button:disabled {{
+  background-color: #f9fafb !important; border-color: #e4e7ec !important;
+  color: #98a2b3 !important; box-shadow: none !important; cursor: not-allowed !important;
+}}
+/* 追加は「次に進む操作」なのでオレンジの枠線だけにする（塗りつぶしは最終実行だけ） */
+.h3-btn-accent, .h3-btn-accent button {{
+  background: #ffffff !important; border: 1px solid #ff7c00 !important;
+  color: #b35300 !important; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06) !important;
+}}
+.h3-btn-accent:hover:not(:disabled), .h3-btn-accent button:hover:not(:disabled) {{
+  background: #fff4e6 !important; border-color: #e06c00 !important;
+}}
+.h3-btn-accent:focus-visible, .h3-btn-accent button:focus-visible {{
+  outline: 2px solid #1570ef !important; outline-offset: 2px !important;
+}}
+.h3-btn-accent.h3-btn-accent:disabled, .h3-btn-accent button:disabled {{
+  background-color: #f9fafb !important; border-color: #e4e7ec !important;
+  color: #98a2b3 !important; box-shadow: none !important; cursor: not-allowed !important;
+}}
 .h3-lan {{
   border: 2px solid #2e7d32; background: #eaf5ea; color: #1b3d1b;
   border-radius: 8px; padding: 10px 12px; line-height: 1.7; word-break: break-word;
@@ -994,8 +1074,26 @@ def build_ui(
             log.exception("連結行を取得できませんでした: %s", _attr(row, "job_id", ""))
             return None
 
+    def _concat_product_rows() -> list:
+        """④の「連結成果物」フィルタ用（チェーン連結＋指定順連結・新しい順）。"""
+        getter = getattr(service, "concat_product_rows", None)
+        if not callable(getter):
+            # 旧サービスでも④が壊れないよう、完成一覧から絞り込む経路を残す
+            return [r for r in _completed_rows() if _attr(r, "kind", "clip") == "concat"]
+        try:
+            return _sorted_newest_first(list(getter()))
+        except Exception:  # 設計書 §13.2
+            log.exception("連結成果物の一覧を取得できませんでした")
+            return []
+
     def _history_rows(status: str | None) -> list:
-        """④履歴タブの一覧（全状態。フィルタは念のため UI 側でも適用する）。"""
+        """④履歴タブの一覧（全状態。フィルタは念のため UI 側でも適用する）。
+
+        「連結成果物」だけは状態ではなく**種類**で絞るので、番兵を見て
+        別経路（`concat_product_rows()`）へ分岐する（P5.3-A）。
+        """
+        if status == CONCAT_PRODUCTS_SENTINEL:
+            return _concat_product_rows()
         if not _has_history_rows:
             return []
         rows: list = []
@@ -1016,30 +1114,81 @@ def build_ui(
 
     # --------------------------------------------------- ③④の描画（純粋関数）
 
-    def _videos_table(rows: list) -> str:
+    def _videos_summary(rows: list) -> str:
+        """③完成・編集タブの要約（P5.3-A）。**一覧表の代わり**。
+
+        以前はここに全動画の Markdown 表を出していたが、27件で3,000px を超え、
+        下にある順番指定連結まで延々とスクロールする必要があった。表は④履歴タブへ
+        一本化し、③は「何件あるか」と「欠損が何件あるか」だけを1〜2行で示す。
+        件数は選択候補と同じ行から数えるので、画面と候補が食い違わない。
+        """
         if not _has_completed_videos:
             return f"### 完成した動画\n{_UNSUPPORTED}"
         if not rows:
             return (
-                "### 完成した動画（0件）\n"
+                "**完成した動画: 0件**\n\n"
                 "まだ完成した動画はありません。①新規生成タブから作ってください。"
             )
+        clips = sum(1 for r in rows if _attr(r, "kind", "clip") == "clip")
+        chains = sum(1 for r in rows if getattr(r, "concat_kind", None) == "chain")
+        manuals = sum(1 for r in rows if getattr(r, "concat_kind", None) == "manual")
+        missing = sum(1 for r in rows if not _attr(r, "exists", False))
+
+        parts = [f"個別{clips}件"]
+        if chains:
+            parts.append(f"チェーン連結{chains}件")
+        if manuals:
+            parts.append(f"指定順連結{manuals}件")
+        head = f"**完成した動画: {len(rows)}件**（{'・'.join(parts)}）"
+        if missing:
+            head += f" ｜ ファイル欠損 {missing}件"
+        lines = [head, "", "一覧は「履歴」タブで見られます。"]
+        if missing:
+            lines.append(
+                f"\n⚠️ ファイルが見つからない記録が {missing} 件あります"
+                "（Finder などで動画を削除するとこうなります）。"
+                "**記録を片づける機能は次の工程で追加予定**です。"
+            )
+        return "\n".join(lines)
+
+    def _concat_products_table(rows: list) -> str:
+        """④履歴タブの「連結成果物」フィルタ用の表（P5.3-A）。
+
+        ジョブ用の列（step / seed / 状態遷移）は連結成果物に意味が無いので使わず、
+        **連結成果物にとって意味のある列**だけを出す。③から一覧表を無くしたため、
+        チェーン連結と指定順連結を表で見られる唯一の場所になる。
+        """
+        if not rows:
+            return (
+                "### 履歴（連結成果物・0件）\n"
+                "まだ連結した動画はありません。"
+                "「完成・編集」タブでつなげると、ここに出ます。"
+            )
         lines = [
-            f"### 完成した動画（{len(rows)}件・新しい順）",
+            f"### 履歴（連結成果物・{len(rows)}件・新しい順）",
             "",
-            "| 種別 | ID | 作成日時 | 長さ | ステップ | seed | 親 | 状態 |",
-            "|---|---|---|---:|---:|---|---|---|",
+            "| 種類 | ID | 作成日時 | 長さ | 本数 | 元の動画（順番どおり） | ファイル |",
+            "|---|---|---|---:|---:|---|---|",
         ]
         for row in rows:
-            kind = _attr(row, "kind", "clip")
-            missing = "" if _attr(row, "exists", False) else " ⚠️ファイル欠損"
+            sources = tuple(getattr(row, "concat_sources", ()) or ())
+            if sources:
+                # 順番が分かることが重要なので、多いときは前後を残して省略する
+                if len(sources) > 4:
+                    shown = f"{sources[0]} → … → {sources[-1]}"
+                else:
+                    shown = " → ".join(str(s) for s in sources)
+            else:
+                shown = "—"
+            exists = _attr(row, "exists", False)
             lines.append(
-                f"| {KIND_LABELS.get(kind, kind)} | `{_cell(_attr(row, 'job_id', ''))}` "
+                f"| {CONCAT_KIND_LABELS.get(getattr(row, 'concat_kind', None), '連結')} "
+                f"| `{_cell(_attr(row, 'job_id', ''))}` "
                 f"| {_cell(_fmt_dt(getattr(row, 'created_at', None)))} "
                 f"| {_cell(_attr(row, 'duration_label', '—'))} "
-                f"| {_cell(_attr(row, 'steps', '—'))} | {_cell(_seed_cell(row))} "
-                f"| {_cell(getattr(row, 'parent_id', None) or '—')} "
-                f"| {'完成' if _attr(row, 'exists', False) else '—'}{missing} |"
+                f"| {_cell(len(sources) if sources else '—')} "
+                f"| {_cell(shown)} "
+                f"| {'あり' if exists else '⚠️ 見つかりません'} |"
             )
         return "\n".join(lines)
 
@@ -1186,13 +1335,16 @@ def build_ui(
         **戻り値は4つ**（P5.2 で末尾に「指定順連結の候補」を追加した）。
         既存の3つの順番は変えていない。候補は `choices` だけを更新するので、
         ユーザーが選びかけている値も、編集中の並びも Timer では壊れない。
+
+        **P5.3-A で先頭の意味だけを「一覧表」→「短い要約」へ変えた**
+        （出力の数・順序・残り3つの意味は不変。設計書 §24.4）。
         """
         try:
             rows = _completed_rows()
-            listing, choices = _videos_table(rows), _select_choices(rows)
+            listing, choices = _videos_summary(rows), _select_choices(rows)
         except Exception:  # 設計書 §13.2: UI の更新を永久に止めない
             log.exception("完成動画の一覧を取得できませんでした")
-            listing = "### 完成した動画\n⚠️ 一覧を取得できません（「詳しい情報（アプリの動作ログ）」をご確認ください）"
+            listing = "⚠️ 完成した動画の件数を取得できません（「詳しい情報（アプリの動作ログ）」をご確認ください）"
             choices = gr.update()
         try:
             concat = _concat_status_text()
@@ -1221,6 +1373,9 @@ def build_ui(
 
     def _history_table(rows: list, filter_label) -> str:
         label = filter_label if filter_label in HISTORY_FILTERS else "すべて"
+        if label == CONCAT_PRODUCTS_FILTER:
+            # 連結成果物には step / seed / 状態遷移が無いので、専用の列で出す
+            return _concat_products_table(rows)
         if not _has_history_rows:
             return f"### 履歴\n{_UNSUPPORTED}"
         if not rows:
@@ -1672,30 +1827,46 @@ def build_ui(
         return gr.update(choices=choices, value=None)
 
     def _order_text(order: list[str]) -> str:
-        """現在の連結順（番号付き）。合計本数と合計時間も出す。"""
+        """現在の連結順（番号付きの本体だけ）。
+
+        **合計はここに入れない**（P5.3-A）。この文章は局所縦スクロールの器
+        `.h3-vscroll` の中に置くので、合計まで一緒に入れると20本選んだときに
+        スクロールしないと合計が読めなくなる。合計は `_order_total_text()` が
+        器の外へ出す。
+        """
         if not order:
             return (
-                "### 現在の連結順\n"
                 "まだ選ばれていません。上の欄で動画を選んで"
                 "［連結候補へ追加］を押してください（2本以上で連結できます）。"
             )
         rows = {_attr(r, "job_id", ""): r for r in _clip_rows()}
-        lines = [f"### 現在の連結順（{len(order)}本）"]
-        total_frames = 0
+        lines = []
         for i, job_id in enumerate(order, start=1):
             row = rows.get(job_id)
             if row is None:
                 lines.append(f"{i}. `{job_id}` ⚠️ 一覧に見つかりません")
                 continue
-            total_frames += int(_attr(row, "num_frames", 0) or 0)
             missing = "" if _attr(row, "exists", False) else " ⚠️ ファイルなし"
             lines.append(
                 f"{i}. `{job_id}` ｜ {_attr(row, 'duration_label', '—')}"
                 f" ｜ {_fmt_dt(getattr(row, 'created_at', None))}{missing}"
             )
-        if total_frames:
-            lines.append(f"\n合計 **{len(order)}本・約{total_frames / FIXED_FPS:.1f}秒**")
         return "\n".join(lines)
+
+    def _order_total_text(order: list[str]) -> str:
+        """合計本数と合計時間（**スクロール領域の外**に出す・P5.3-A）。"""
+        if not order:
+            return f"**現在の連結順: 0本**（{MIN_CUSTOM_CLIPS}本以上で連結できます）"
+        rows = {_attr(r, "job_id", ""): r for r in _clip_rows()}
+        total_frames = sum(
+            int(_attr(rows.get(j), "num_frames", 0) or 0) for j in order if j in rows
+        )
+        text = f"**現在の連結順: {len(order)}本**"
+        if total_frames:
+            text += f" ｜ 合計 約{total_frames / FIXED_FPS:.1f}秒"
+        if len(order) < MIN_CUSTOM_CLIPS:
+            text += f"（あと{MIN_CUSTOM_CLIPS - len(order)}本で連結できます）"
+        return text
 
     def _concat_button_label(order: list[str]) -> str:
         if len(order) < MIN_CUSTOM_CLIPS:
@@ -1708,13 +1879,18 @@ def build_ui(
         return f"▶ この順番で連結（{len(order)}本・約{seconds:.1f}秒）"
 
     def _custom_view(order: list[str], message: str = "") -> tuple:
-        """並びから画面を組み立て直す（全ハンドラ共通の戻り値）。"""
+        """並びから画面を組み立て直す（全ハンドラ共通の戻り値）。
+
+        P5.3-A で合計表示（`custom_total_md`）を**末尾に追加**した。
+        既存の5つの順番と意味は変えていない。
+        """
         return (
             list(order),
             _order_text(order),
             _order_choices(order),
             gr.update(value=_concat_button_label(order)),
             message,
+            _order_total_text(order),
         )
 
     def on_custom_add(order, job_id):
@@ -2135,14 +2311,22 @@ def build_ui(
                 with gr.Accordion("詳しい情報（サポート用）", open=False):
                     queue_detail_md = gr.Markdown(_queue_detail_view())
 
-            # ------------------------------------------------ ③ 完成動画（P4）
-            with gr.Tab("完成動画", id="tab_videos"):
+            # --------------------------------- ③ 完成・編集（P4 → P5.3-A で再設計）
+            #
+            # 「見る画面」から「作業する画面」へ。全動画の一覧表は④へ一本化し、
+            # ここは 上段（選ぶ／プレビューと操作）＋ 下段（順番指定連結）の2段にした。
+            # **DOM の並び順がそのまま iPhone の1カラム表示順**になるので、
+            # CSS の order 指定や独自 JavaScript を使わずに希望順を満たせる（§24.3）。
+            with gr.Tab(VIDEOS_TAB_LABEL, id="tab_videos"):
                 initial_videos = _videos_view()
+                # ---- 上段: 左＝作業する動画を選ぶ／右＝プレビューと操作
+                #
+                # 一覧表が無くなって左が短くなったので、**右を広く**とる
+                # （プレビューと操作ボタンが横に並び、右カラムの背が低くなって
+                # 左側にできる空白が小さくなる）。iPhone では順番に畳まれる。
                 with gr.Row(elem_classes=["h3-row"]):
-                    with gr.Column(scale=3):
-                        # P5.1: 選ぶ操作を一覧より**上**に置く。一覧が伸びても
-                        # タブを開いた直後に操作できる（配置だけの変更で、
-                        # 選択・表示の機能そのものは P4 のまま）。
+                    with gr.Column(scale=2):
+                        gr.Markdown("### 作業する動画")
                         with gr.Row(elem_classes=["h3-row", "h3-tap"]):
                             video_select = gr.Dropdown(
                                 choices=[],
@@ -2154,49 +2338,11 @@ def build_ui(
                             video_reload_btn = gr.Button(
                                 "↻ 選んだ動画を表示", size="sm"
                             )
-                        videos_list_md = gr.Markdown(
-                            initial_videos[0], elem_classes=["h3-scroll"]
+                        # P5.3-A: 長大な一覧表の代わりに件数だけを出す（表は④へ）
+                        videos_summary_md = gr.Markdown(
+                            initial_videos[0], elem_classes=["h3-note"]
                         )
-
-                        # ---- P5.2: 指定順連結（既定は閉じておく。既存操作を隠さない）
-                        with gr.Accordion(CUSTOM_CONCAT_TITLE, open=False):
-                            gr.Markdown(
-                                "好きな動画を好きな順番でつなげます。"
-                                "**上から順に**再生される1本の動画になります"
-                                f"（{MIN_CUSTOM_CLIPS}〜{MAX_CUSTOM_CLIPS}本・"
-                                "元の動画はそのまま残ります）。",
-                                elem_classes=["h3-note"],
-                            )
-                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
-                                custom_pick = gr.Dropdown(
-                                    choices=[],
-                                    value=None,
-                                    label="追加する動画を選ぶ（個別動画のみ）",
-                                    allow_custom_value=True,
-                                    interactive=True,
-                                )
-                                custom_add_btn = gr.Button("＋ 連結候補へ追加", size="sm")
-                            custom_order_md = gr.Markdown(_order_text([]))
-                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
-                                custom_target = gr.Dropdown(
-                                    choices=[],
-                                    value=None,
-                                    label="対象を選ぶ（順番の入れ替え・削除）",
-                                    allow_custom_value=True,
-                                    interactive=True,
-                                )
-                                custom_up_btn = gr.Button("↑ 上へ", size="sm")
-                                custom_down_btn = gr.Button("↓ 下へ", size="sm")
-                                custom_remove_btn = gr.Button("－ 削除", size="sm")
-                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
-                                custom_clear_btn = gr.Button(
-                                    "選択をすべて解除", size="sm", variant="secondary"
-                                )
-                                custom_start_btn = gr.Button(
-                                    CUSTOM_CONCAT_LABEL, variant="primary"
-                                )
-                            custom_msg_md = gr.Markdown("")
-                    with gr.Column(scale=2):
+                    with gr.Column(scale=3):
                         video_player3 = gr.Video(
                             label="プレビュー", interactive=False, autoplay=False
                         )
@@ -2207,13 +2353,77 @@ def build_ui(
                             )
                             video_concat_btn = gr.Button("ルートからここまでを連結")
                             video_reveal_btn = gr.Button("Finderで表示（Macのみ）")
+                        # ここが将来 [1080p高品質化] を足す場所（P6）。今は何も置かない
                         videos_msg_md = gr.Markdown("")
                         gr.Markdown(FINDER_NOTE, elem_classes=["h3-note"])
-                        concat_status_md = gr.Markdown(initial_videos[2])
                         with gr.Accordion("詳しい情報（サポート用）", open=False):
                             video_tech_md = gr.Markdown(
                                 "動画を選ぶと、ここに技術的な情報が出ます。"
                             )
+
+                # ---- 下段: 順番指定連結（P5.3-A で Accordion をやめ常時表示）
+                #
+                # 一覧表が無くなってページが短くなったので、隠す理由が消えた。
+                # 機能・配線・純粋関数は P5.2 のまま（部品の置き場所だけを変えた）。
+                with gr.Group(elem_classes=["h3-panel"]):
+                    gr.Markdown(f"### {CUSTOM_CONCAT_TITLE}")
+                    gr.Markdown(
+                        "好きな動画を好きな順番でつなげます。"
+                        "**上から順に**再生される1本の動画になります"
+                        f"（{MIN_CUSTOM_CLIPS}〜{MAX_CUSTOM_CLIPS}本）。"
+                        "**元の動画ファイルは変わりません。**"
+                        "［候補から外す］［連結候補をすべて解除］は、"
+                        "ここで組み立てている順番から外すだけで、動画は削除されません。",
+                        elem_classes=["h3-note"],
+                    )
+                    with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                        custom_pick = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="追加する動画を選ぶ（個別動画のみ）",
+                            allow_custom_value=True,
+                            interactive=True,
+                        )
+                        custom_add_btn = gr.Button(
+                            CUSTOM_ADD_LABEL, size="sm", elem_classes=["h3-btn-accent"]
+                        )
+                    # 合計は**スクロール領域の外**に出す（20本でも常に読める）
+                    custom_total_md = gr.Markdown(_order_total_text([]))
+                    custom_order_md = gr.Markdown(
+                        _order_text([]), elem_classes=["h3-vscroll"]
+                    )
+                    with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                        custom_target = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="対象を選ぶ（順番の入れ替え・候補から外す）",
+                            allow_custom_value=True,
+                            interactive=True,
+                        )
+                        custom_up_btn = gr.Button(
+                            CUSTOM_UP_LABEL, size="sm", elem_classes=["h3-btn"]
+                        )
+                        custom_down_btn = gr.Button(
+                            CUSTOM_DOWN_LABEL, size="sm", elem_classes=["h3-btn"]
+                        )
+                        custom_remove_btn = gr.Button(
+                            CUSTOM_REMOVE_LABEL, size="sm", elem_classes=["h3-btn"]
+                        )
+                    with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                        custom_clear_btn = gr.Button(
+                            CUSTOM_CLEAR_LABEL,
+                            size="sm",
+                            variant="secondary",
+                            elem_classes=["h3-btn"],
+                        )
+                        # **塗りつぶしのオレンジはこの最終実行だけ**にする
+                        custom_start_btn = gr.Button(
+                            CUSTOM_CONCAT_LABEL, variant="primary"
+                        )
+                    custom_msg_md = gr.Markdown("")
+
+                # ---- 連結の状態（チェーン連結・指定順連結の共通表示）はフル幅
+                concat_status_md = gr.Markdown(initial_videos[2])
 
             # ------------------------------------------------ ④ 履歴（P4）
             with gr.Tab("履歴", id="tab_history"):
@@ -2350,8 +2560,9 @@ def build_ui(
         # ------------------------------------------------ ③完成動画タブの配線（P4）
         # P5.2 で末尾に custom_pick を追加した（既存3つの順番は変えていない）。
         # **candidate の choices だけ**を更新するので、編集中の並びには触れない。
+        # P5.3-A では**先頭の中身**を一覧表から要約へ替えただけで、数も順番も不変。
         videos_outputs = [
-            videos_list_md,
+            videos_summary_md,
             video_select,
             concat_status_md,
             custom_pick,
@@ -2383,6 +2594,8 @@ def build_ui(
             custom_target,
             custom_start_btn,
             custom_msg_md,
+            # P5.3-A: 合計（スクロール領域の外）。末尾追加で既存5つは不変
+            custom_total_md,
         ]
         custom_add_btn.click(
             on_custom_add,

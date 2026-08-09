@@ -32,6 +32,12 @@ import pytest
 from app.core.app_service import AppService, SubmitResult
 from app.core.config import load_config
 from app.ui.minimal import (
+    CUSTOM_ADD_LABEL,
+    CUSTOM_CLEAR_LABEL,
+    CUSTOM_CONCAT_TITLE,
+    CUSTOM_DOWN_LABEL,
+    CUSTOM_REMOVE_LABEL,
+    CUSTOM_UP_LABEL,
     FINDER_NOTE,
     HISTORY_EMPTY_NOTE,
     MOBILE_BREAKPOINT_PX,
@@ -40,6 +46,7 @@ from app.ui.minimal import (
     SUBMIT_LABEL,
     SUBMIT_LABEL_BUSY,
     VIDEOS_EMPTY_NOTE,
+    VIDEOS_TAB_LABEL,
     build_ui,
 )
 
@@ -113,6 +120,16 @@ def ui_config(mobile_app):
     _client, _service, _demo, port = mobile_app
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/config", timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+@pytest.fixture(scope="module")
+def p4_history_table(mobile_app):
+    """記録が1件以上あるときの④履歴表（0件では見出し行が出ないため）。"""
+    client, service, _demo, _port = mobile_app
+    service.submit_generation_ex(
+        prompt="履歴表の確認用", num_frames=56, steps=4, seed_requested=7
+    )
+    return str(client.predict("すべて", api_name="/on_history_filter")[0])
 
 
 @pytest.fixture()
@@ -311,20 +328,24 @@ def test_wide_tables_are_wrapped_in_a_local_scroll_container(offline_demo, ui_co
     """
     _cfg, _service, demo = offline_demo
     by_api = {fn.api_name: fn for fn in demo.fns.values()}
+    # P5.3-A: ③の完成動画表は廃止したので、表を出す Timer は②と④だけになった
     table_outputs = {
         "on_queue_tick": 3,   # 待機中のジョブ（表）
-        "on_videos_tick": 0,  # 完成した動画（表）
-        "on_history_tick": 0,  # 履歴（13列の表）
+        "on_history_tick": 0,  # 履歴（13列の表・連結成果物の表）
     }
     for api_name, index in table_outputs.items():
         component = by_api[api_name].outputs[index]
         classes = list(getattr(component, "elem_classes", []) or [])
         assert "h3-scroll" in classes, f"{api_name} の表に h3-scroll がありません"
 
+    # ③の先頭は表ではなく要約（横に広がらないので h3-scroll は不要）
+    summary = by_api["on_videos_tick"].outputs[0]
+    assert "h3-scroll" not in list(getattr(summary, "elem_classes", []) or [])
+
     scrollable = [
         c for c in _components(ui_config, "markdown") if "h3-scroll" in _classes(c)
     ]
-    assert len(scrollable) >= 3, "表を出す Markdown に h3-scroll が足りません"
+    assert len(scrollable) >= 2, "表を出す Markdown に h3-scroll が足りません"
 
     # 起動直後に表がある部品（履歴の見出し行）も器の中に入っている
     for component in _components(ui_config, "markdown"):
@@ -347,7 +368,13 @@ def test_all_four_tabs_are_reachable(ui_config):
     ids = {t.get("props", {}).get("id") for t in tabs}
     labels = {t.get("props", {}).get("label") for t in tabs}
     assert {"tab_new", "tab_queue", "tab_videos", "tab_history"} <= ids
-    assert {"新規生成", "キュー", "完成動画", "履歴"} <= labels
+    # P5.3-A: ③は「完成動画」から「完成・編集」へ改称した（**内部IDは不変**）
+    assert {"新規生成", "キュー", "完成・編集", "履歴"} <= labels
+    assert "完成動画" not in labels
+    videos_tab = _only(
+        [t for t in tabs if t.get("props", {}).get("id") == "tab_videos"], "③タブ"
+    )
+    assert videos_tab["props"]["label"] == VIDEOS_TAB_LABEL
 
 
 def test_detail_accordions_exist_on_every_tab_that_shows_technical_text(ui_config):
@@ -797,17 +824,48 @@ def test_clear_prompt_never_writes_to_anything_but_the_prompt(offline_demo):
     assert "プロンプト（英語推奨" in str(fn.outputs[0].label)
 
 
-def test_video_selector_is_shown_above_the_list_on_the_completed_tab(ui_config):
-    """③完成動画タブ: 選択欄と［選んだ動画を表示］が一覧の見出しより上に1組だけある。"""
+def test_completed_tab_has_no_video_table(ui_config, offline_demo):
+    """③完成・編集タブに**全動画の一覧表が無い**（P5.3-A で④へ一本化した）。
+
+    P5.1 では「選択欄を一覧より上へ」を確かめていたが、その一覧自体を廃止した。
+    ここでは「表が復活していないこと」を代わりに固定する。
+    """
+    # 表の見出しも列も③には無い
+    assert _by_value(ui_config, "markdown", "### 完成した動画（") == []
+    for component in _components(ui_config, "markdown"):
+        value = str(component.get("props", {}).get("value") or "")
+        if "| 種別 | ID | 作成日時 | 長さ | ステップ |" in value:
+            raise AssertionError(f"③の完成動画表が残っています: {component['id']}")
+
+    # ③の選択欄は今もタブの先頭側にある（要約より上）
     select = _only(
         _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "選択欄"
     )
     reload_btn = _only(_by_value(ui_config, "button", "↻ 選んだ動画を表示"), "表示ボタン")
-    listing = _only(_by_value(ui_config, "markdown", "### 完成した動画"), "完成動画の一覧")
-
+    summary = _only(_by_value(ui_config, "markdown", "**完成した動画:"), "完成動画の要約")
     order = _display_order(ui_config)
-    assert order.index(select["id"]) < order.index(listing["id"]), "選択欄が一覧より下にあります"
-    assert order.index(reload_btn["id"]) < order.index(listing["id"]), "表示ボタンが一覧より下にあります"
+    assert order.index(select["id"]) < order.index(summary["id"])
+    assert order.index(reload_btn["id"]) < order.index(summary["id"])
+
+    # 要約は Timer の先頭出力そのもの（表示と更新先が食い違わない）
+    _cfg, _service, demo = offline_demo
+    by_api = {fn.api_name: fn for fn in demo.fns.values()}
+    assert by_api["on_videos_tick"].outputs[0].value == summary["props"]["value"]
+
+
+def test_history_tab_still_has_its_table(offline_demo, p4_history_table):
+    """④履歴タブの表は残る（一覧はこちらへ一本化した）。
+
+    起動直後は0件で見出し行が出ないため、(a) 表を出す部品が Timer の出力先として
+    今もあること (b) 記録があるときに実際に表が描かれること、の両方を見る。
+    """
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    table = by_api["on_history_tick"].outputs[0]
+    assert "h3-scroll" in list(getattr(table, "elem_classes", []) or [])
+    assert "履歴" in str(table.value)
+
+    assert "| 状態 | 種別 | 日時 | ID |" in p4_history_table
 
 
 def test_video_selector_row_keeps_one_column_and_44px_on_iphone(ui_config):
@@ -830,8 +888,11 @@ def test_completed_tab_still_wires_select_reload_and_actions(offline_demo):
         "on_start_continuation",
     ):
         assert by_api[api_name].inputs == [select], f"{api_name} の入力が選択欄ではありません"
-    # Timer の出力順（一覧・選択欄・連結状態）は配置換えの影響を受けない
-    assert "h3-scroll" in list(by_api["on_videos_tick"].outputs[0].elem_classes or [])
+    # Timer の出力（要約・選択欄・連結状態・候補）は配置換えの影響を受けない
+    tick = by_api["on_videos_tick"].outputs
+    assert len(tick) == 4
+    assert type(tick[0]).__name__ == "Markdown"  # P5.3-A: 表ではなく要約
+    assert type(tick[2]).__name__ == "Markdown"  # 連結の状態
 
 
 def test_completed_tab_guidance_matches_the_new_selector_position(ui_config, mobile_app):
@@ -895,25 +956,34 @@ def test_history_tab_keeps_its_own_guidance(ui_config, mobile_app):
 # ------------------------------------------------- P5.2 指定順連結（③タブ）
 
 
-def test_custom_concat_accordion_exists_and_starts_closed(ui_config):
-    """既存の操作を隠さないよう、初期状態は閉じている。"""
+def test_custom_concat_is_always_visible_without_an_accordion(ui_config):
+    """指定順連結は**常時表示**（P5.3-A で折りたたみを廃止した）。
+
+    一覧表を④へ移してページが短くなったので、隠す理由が無くなった。
+    折りたたみが復活すると「開かないと使えない」状態に戻るため、ここで固定する。
+    """
     accordions = [
         a
         for a in _components(ui_config, "accordion")
         if "複数の動画を選んで連結" in str(a.get("props", {}).get("label") or "")
     ]
-    assert len(accordions) == 1, "指定順連結の折りたたみが1つだけ存在するはず"
-    assert accordions[0]["props"].get("open") is False
+    assert accordions == [], "指定順連結が折りたたみに戻っています"
+
+    # 見出しは通常の Markdown として常に見えている
+    heading = _only(
+        _by_value(ui_config, "markdown", f"### {CUSTOM_CONCAT_TITLE}"), "見出し"
+    )
+    assert heading["props"]["value"].startswith("### ")
 
 
 def test_custom_concat_controls_are_present_once(ui_config):
-    """追加・上下移動・削除・全解除・実行のボタンが1組だけある。"""
+    """追加・上下移動・候補から外す・全解除・実行のボタンが1組だけある。"""
     for text in (
-        "＋ 連結候補へ追加",
-        "↑ 上へ",
-        "↓ 下へ",
-        "－ 削除",
-        "選択をすべて解除",
+        CUSTOM_ADD_LABEL,
+        CUSTOM_UP_LABEL,
+        CUSTOM_DOWN_LABEL,
+        CUSTOM_REMOVE_LABEL,
+        CUSTOM_CLEAR_LABEL,
     ):
         _only(_by_value(ui_config, "button", text), f"{text} ボタン")
     _only(
@@ -929,37 +999,39 @@ def test_custom_concat_controls_are_present_once(ui_config):
 
 
 def test_custom_concat_is_separate_from_the_view_selector(ui_config):
-    """既存の「表示する動画を選ぶ」と別の操作領域になっている（取り違え防止）。"""
+    """既存の「表示する動画を選ぶ」と別の操作領域になっている（取り違え防止）。
+
+    P5.3-A で折りたたみを廃止したので、見出しから下の**下段**にあること
+    （＝上段の表示用選択欄とは別のまとまり）で分離を確かめる。
+    """
     view_selector = _only(
         _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "表示用選択欄"
     )
     add_selector = _only(_by_label(ui_config, "dropdown", "追加する動画を選ぶ"), "候補選択欄")
     assert view_selector["id"] != add_selector["id"]
+    assert view_selector["props"]["label"] != add_selector["props"]["label"]
 
+    order = _display_order(ui_config)
+    heading = _only(
+        _by_value(ui_config, "markdown", f"### {CUSTOM_CONCAT_TITLE}"), "見出し"
+    )
+    # 表示用選択欄（上段） → 見出し → 候補選択欄（下段）の順に並ぶ
+    assert order.index(view_selector["id"]) < order.index(heading["id"])
+    assert order.index(heading["id"]) < order.index(add_selector["id"])
+
+    # 親が違う＝別のまとまりに入っている
     parents = _parents(ui_config)
-    # 候補選択欄だけが Accordion の中にある
-    accordion_ids = {
-        a["id"]
-        for a in _components(ui_config, "accordion")
-        if "複数の動画を選んで連結" in str(a.get("props", {}).get("label") or "")
-    }
-
-    def ancestors(component_id):
-        seen = []
-        while component_id in parents:
-            component_id = parents[component_id]
-            seen.append(component_id)
-        return set(seen)
-
-    assert ancestors(add_selector["id"]) & accordion_ids
-    assert not (ancestors(view_selector["id"]) & accordion_ids)
+    assert parents[view_selector["id"]] != parents[add_selector["id"]]
 
 
 def test_custom_concat_rows_stack_and_keep_44px_on_iphone(ui_config):
     """1カラム化（h3-row）と 44px タップ領域（h3-tap）を全操作行が持つ。"""
     by_id = {c["id"]: c for c in ui_config["components"]}
     parents = _parents(ui_config)
-    for text in ("＋ 連結候補へ追加", "↑ 上へ", "↓ 下へ", "－ 削除", "選択をすべて解除"):
+    for text in (
+        CUSTOM_ADD_LABEL, CUSTOM_UP_LABEL, CUSTOM_DOWN_LABEL,
+        CUSTOM_REMOVE_LABEL, CUSTOM_CLEAR_LABEL,
+    ):
         button = _only(_by_value(ui_config, "button", text), f"{text} ボタン")
         row = by_id[parents[button["id"]]]
         assert {"h3-row", "h3-tap"} <= set(_classes(row)), text
@@ -1025,10 +1097,311 @@ def test_existing_completed_tab_controls_are_not_regressed(ui_config):
     # ③④の両方にあるもの（P4 からの既存仕様）
     for text in ("この動画の続きを作る", "ルートからここまでを連結", "Finderで表示（Macのみ）"):
         assert _by_value(ui_config, "button", text), f"{text} ボタンが消えています"
-    # 選択欄は今も一覧より上（P5.1 の配置を維持）
+    # 選択欄は今もタブの先頭側（P5.1 の「まず選べる」意図を維持）。
+    # P5.3-A で一覧表が要約に変わったので、比較相手を要約にしている。
     order = _display_order(ui_config)
     select = _only(
         _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "選択欄"
     )
-    listing = _only(_by_value(ui_config, "markdown", "### 完成した動画"), "一覧")
-    assert order.index(select["id"]) < order.index(listing["id"])
+    summary = _only(_by_value(ui_config, "markdown", "**完成した動画:"), "要約")
+    assert order.index(select["id"]) < order.index(summary["id"])
+
+
+# ------------------------------- P5.3-A 完成・編集ワークスペース（③の再設計）
+
+
+def test_completed_tab_layout_order_matches_the_iphone_reading_order(ui_config):
+    """DOM の並び＝iPhone の1カラム表示順（P5.3-A・設計書 §24.3）。
+
+    希望順は「選ぶ → プレビュー → 選択動画への操作 → 順番指定連結 → 連結の状態」。
+    CSS の order や独自 JavaScript を使わずに済むよう、**この順に組み立てている**。
+    """
+    order = _display_order(ui_config)
+    select = _only(
+        _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "選択欄"
+    )
+    preview = _only(
+        [v for v in _components(ui_config, "video")
+         if v.get("props", {}).get("label") == "プレビュー"],
+        "プレビュー",
+    )
+    continue_btn = [
+        b for b in _by_value(ui_config, "button", "この動画の続きを作る")
+        if order.index(b["id"]) > order.index(preview["id"])
+    ][0]
+    concat_heading = _only(
+        _by_value(ui_config, "markdown", f"### {CUSTOM_CONCAT_TITLE}"), "連結の見出し"
+    )
+    status = _only(_by_value(ui_config, "markdown", "### 連結の状態"), "連結の状態")
+
+    positions = [
+        order.index(c["id"])
+        for c in (select, preview, continue_btn, concat_heading, status)
+    ]
+    assert positions == sorted(positions), f"表示順が希望と違います: {positions}"
+
+
+def test_completed_tab_has_two_columns_on_mac(ui_config):
+    """Mac では上段が2カラム（選ぶ／プレビューと操作）。iPhone では h3-row で畳む。"""
+    parents = _parents(ui_config)
+    by_id = {c["id"]: c for c in ui_config["components"]}
+    select = _only(
+        _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "選択欄"
+    )
+    preview = _only(
+        [v for v in _components(ui_config, "video")
+         if v.get("props", {}).get("label") == "プレビュー"],
+        "プレビュー",
+    )
+
+    def column_of(component_id):
+        while component_id in parents:
+            component_id = parents[component_id]
+            if by_id.get(component_id, {}).get("type") == "column":
+                return component_id
+        return None
+
+    left, right = column_of(select["id"]), column_of(preview["id"])
+    assert left and right and left != right, "上段が2カラムになっていません"
+    row = parents[left]
+    assert row == parents[right], "2つのカラムが同じ Row に入っていません"
+    assert "h3-row" in _classes(by_id[row]), "iPhone で1カラムへ畳めません"
+
+
+def test_concat_order_list_scrolls_locally(ui_config):
+    """連結順の一覧だけが縦スクロール（20本でもページ全体は伸びない）。"""
+    scrollers = [
+        c for c in _components(ui_config, "markdown") if "h3-vscroll" in _classes(c)
+    ]
+    assert len(scrollers) == 1, "連結順の局所スクロールが1つだけあるはず"
+
+    _outside, inside = _split_css(MOBILE_CSS)
+    assert ".h3-vscroll" in MOBILE_CSS
+    # レイアウト規則はメディアクエリの外でも .h3- 接頭辞なら許される（既存規約）
+    assert "max-height" in MOBILE_CSS and "overflow-y: auto" in MOBILE_CSS
+    # 横には広げない（横スクロールの原因を作らない）
+    rules = dict(re.findall(r"([^{}]+)\{([^{}]*)\}", re.sub(r"/\*.*?\*/", "", MOBILE_CSS, flags=re.S)))
+    vscroll = next(body for sel, body in rules.items() if ".h3-vscroll" in sel)
+    assert "overflow-x" not in vscroll
+
+
+def test_concat_total_is_outside_the_scroll_area(ui_config, offline_demo):
+    """合計本数・合計時間はスクロール領域の**外**にある（20本でも常に読める）。"""
+    order = _display_order(ui_config)
+    total = _only(_by_value(ui_config, "markdown", "**現在の連結順:"), "合計表示")
+    scroller = _only(
+        [c for c in _components(ui_config, "markdown") if "h3-vscroll" in _classes(c)],
+        "連結順の一覧",
+    )
+    assert "h3-vscroll" not in _classes(total)
+    assert order.index(total["id"]) < order.index(scroller["id"])
+
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    outputs = by_api["on_custom_add"].outputs
+    assert len(outputs) == 6, "合計表示が出力に含まれていません"
+    assert "h3-vscroll" in list(getattr(outputs[1], "elem_classes", []) or [])
+    assert "h3-vscroll" not in list(getattr(outputs[5], "elem_classes", []) or [])
+
+
+def test_history_tab_has_a_concat_products_filter(ui_config):
+    """④に「連結成果物」フィルタがあり、既存7フィルタは非回帰（P5.3-A）。"""
+    radios = [
+        r for r in _components(ui_config, "radio")
+        if "状態フィルタ" in str(r.get("props", {}).get("label") or "")
+    ]
+    assert len(radios) == 1
+    choices = [
+        c[0] if isinstance(c, (list, tuple)) else c
+        for c in radios[0]["props"]["choices"]
+    ]
+    assert choices[:7] == ["すべて", "成功", "失敗", "取消", "中断", "実行待ち", "実行中"]
+    assert choices[7] == "連結成果物"
+    assert radios[0]["props"]["value"] == "すべて"  # 既定は従来どおり
+
+
+def test_timer_still_never_touches_the_custom_concat_editing_state(offline_demo):
+    """再設計後も Timer は編集中の状態（State・連結順・合計・対象欄・実行ボタン）に触れない。"""
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    tick = by_api["on_videos_tick"].outputs
+    assert len(tick) == 4
+
+    editing = {
+        id(o)
+        for o in by_api["on_custom_add"].outputs
+        if type(o).__name__ in ("State", "Button")
+        or "h3-vscroll" in list(getattr(o, "elem_classes", []) or [])
+    }
+    assert editing, "編集中の部品を特定できていません"
+    assert not (editing & {id(o) for o in tick}), "Timer が編集中の部品を上書きします"
+
+    labels = [str(getattr(o, "label", "") or "") for o in tick]
+    assert not any("対象を選ぶ" in label for label in labels)
+    assert "追加する動画を選ぶ" in labels[3]  # 候補の choices だけは更新する
+
+
+# ------------------- P5.3-A 仕上げ: 順番指定連結の視認性（外観の契約）
+#
+# Gradio の Group 既定背景（薄い灰色）と secondary ボタンの灰色がほとんど同じで、
+# 補助操作が「押せるもの」に見えなかった。パネルを白く、ボタンを白＋枠線にして
+# 境界を作る。**塗りつぶしのオレンジは最終実行だけ**に残す。
+
+
+def test_custom_concat_panel_has_its_own_class(ui_config):
+    """連結セクションが専用クラスのパネルになっている（Gradio 既定背景に任せない）。"""
+    panels = [
+        c for c in ui_config["components"] if "h3-panel" in _classes(c)
+    ]
+    assert len(panels) == 1, "順番指定連結のパネルが1つだけあるはず"
+    assert panels[0]["type"] == "group"
+
+    # パネルの中に連結の操作が入っている
+    parents = _parents(ui_config)
+    add = _only(_by_value(ui_config, "button", CUSTOM_ADD_LABEL), "追加ボタン")
+
+    def ancestors(component_id):
+        seen = set()
+        while component_id in parents:
+            component_id = parents[component_id]
+            seen.add(component_id)
+        return seen
+
+    assert panels[0]["id"] in ancestors(add["id"])
+
+
+def test_helper_buttons_are_outlined_and_not_the_primary(ui_config):
+    """補助操作は専用クラスの白ボタン。**塗りつぶしの主ボタンにはしない**。"""
+    for text in (CUSTOM_UP_LABEL, CUSTOM_DOWN_LABEL, CUSTOM_REMOVE_LABEL, CUSTOM_CLEAR_LABEL):
+        button = _only(_by_value(ui_config, "button", text), f"{text} ボタン")
+        assert "h3-btn" in _classes(button), f"{text} に h3-btn がありません"
+        assert "h3-btn-accent" not in _classes(button)
+        assert button["props"].get("variant") != "primary"
+
+
+def test_add_button_is_accented_but_weaker_than_the_run_button(ui_config):
+    """追加はオレンジの**枠線だけ**。塗りつぶしのオレンジは最終実行の1つだけ。"""
+    add = _only(_by_value(ui_config, "button", CUSTOM_ADD_LABEL), "追加ボタン")
+    assert "h3-btn-accent" in _classes(add)
+    assert add["props"].get("variant") != "primary"
+
+    run = _only(
+        [
+            b for b in _components(ui_config, "button")
+            if str(b.get("props", {}).get("value") or "").startswith("▶ この順番で連結")
+        ],
+        "実行ボタン",
+    )
+    assert run["props"].get("variant") == "primary"
+    assert not _classes(run), "実行ボタンは既定の主ボタンのまま"
+
+    # ③タブで塗りつぶしの主ボタンは「続きを作る」と「この順番で連結」だけ
+    primaries = [
+        str(b["props"].get("value") or "")
+        for b in _components(ui_config, "button")
+        if b["props"].get("variant") == "primary"
+    ]
+    assert any(p.startswith("▶ この順番で連結") for p in primaries)
+    assert not any("候補" in p or "上へ" in p or "下へ" in p for p in primaries)
+
+
+def test_button_styles_are_scoped_and_not_global(ui_config):
+    """`.h3-` 付きの選択子だけで書く（グローバルな button 指定を足さない）。"""
+    outside, inside = _split_css(MOBILE_CSS)
+    without_comments = re.sub(r"/\*.*?\*/", "", outside, flags=re.S)
+    for selector in re.findall(r"([^{}]+)\{", without_comments):
+        for part in selector.split(","):
+            part = part.strip()
+            assert part.startswith(".h3-") or part.startswith(".gradio-container video"), (
+                f"Mac にも効くグローバル指定が増えています: {part}"
+            )
+    # 追加した規則は button 単独ではなく必ずクラスの下にある
+    assert ".h3-btn, .h3-btn button" in MOBILE_CSS
+    assert ".h3-btn-accent, .h3-btn-accent button" in MOBILE_CSS
+    # メディアクエリの中の 44px 指定（既存）はそのまま
+    assert ".gradio-container button" in inside
+
+
+def test_helper_buttons_define_hover_focus_and_disabled(ui_config):
+    """通常・hover・focus・disabled が見分けられる指定になっている。
+
+    ※ disabled の**色**は Gradio 6.22.0 のボタン CSS が優先するため実描画では
+    変わらない（`cursor: not-allowed` は効く）。この画面のボタンは無効にならない
+    ので実害はないが、将来 `interactive=False` を使うときのために定義は残す。
+    """
+    css = MOBILE_CSS
+    for base in (".h3-btn", ".h3-btn-accent"):
+        assert f"{base}:hover:not(:disabled)" in css, f"{base} の hover がありません"
+        assert f"{base}:focus-visible" in css, f"{base} の focus がありません"
+        assert f"{base}:disabled" in css, f"{base} の disabled がありません"
+        assert "cursor: not-allowed" in css
+    # 危険色（赤系）は使わない。P5.3-B の「ゴミ箱へ移動」のために残す
+    rules = dict(re.findall(r"([^{}]+)\{([^{}]*)\}", re.sub(r"/\*.*?\*/", "", css, flags=re.S)))
+    for selector, body in rules.items():
+        if ".h3-btn" in selector:
+            assert "#d92d20" not in body and "red" not in body.lower(), selector
+
+
+def test_panel_and_buttons_use_different_backgrounds(ui_config):
+    """パネル背景とボタン背景が同じ色にならない（同化の再発防止）。"""
+    rules = dict(
+        re.findall(r"([^{}]+)\{([^{}]*)\}", re.sub(r"/\*.*?\*/", "", MOBILE_CSS, flags=re.S))
+    )
+
+    def background_of(name):
+        body = next(b for sel, b in rules.items() if sel.strip().startswith(name))
+        return re.search(r"background:\s*([^;!]+)", body).group(1).strip()
+
+    panel = background_of(".h3-panel")
+    button = background_of(".h3-btn,")
+    assert panel != button, "パネルとボタンの背景が同じ色です（同化の再発）"
+    assert button == "#ffffff"
+    # 見分けの主役は枠線（背景差はごく僅かなので、枠が無いと境界が消える）
+    border = next(b for sel, b in rules.items() if sel.strip().startswith(".h3-btn,"))
+    assert "border: 1px solid" in border
+    panel_body = next(b for sel, b in rules.items() if sel.strip().startswith(".h3-panel"))
+    assert "border: 1px solid" in panel_body
+
+
+def test_new_labels_replace_the_ambiguous_delete_wording(ui_config):
+    """「削除」を「候補から外す」へ。ファイル削除と混同させない（P5.3-A 仕上げ）。"""
+    assert CUSTOM_UP_LABEL == "↑ 1つ上へ"
+    assert CUSTOM_DOWN_LABEL == "↓ 1つ下へ"
+    assert CUSTOM_REMOVE_LABEL == "－ 候補から外す"
+    assert CUSTOM_CLEAR_LABEL == "連結候補をすべて解除"
+
+    values = [str(b["props"].get("value") or "") for b in _components(ui_config, "button")]
+    for label in (CUSTOM_UP_LABEL, CUSTOM_DOWN_LABEL, CUSTOM_REMOVE_LABEL, CUSTOM_CLEAR_LABEL):
+        assert label in values
+    for old in ("↑ 上へ", "↓ 下へ", "－ 削除", "選択をすべて解除"):
+        assert old not in values, f"古い文言が残っています: {old}"
+
+    # 対象選択欄の説明も揃える
+    target = _only(_by_label(ui_config, "dropdown", "対象を選ぶ"), "対象選択欄")
+    assert target["props"]["label"] == "対象を選ぶ（順番の入れ替え・候補から外す）"
+
+    # 「動画は削除されない」ことがパネルの説明に書いてある
+    notes = [
+        str(c["props"].get("value") or "")
+        for c in _components(ui_config, "markdown")
+        if "h3-note" in _classes(c)
+    ]
+    assert any("動画は削除されません" in n for n in notes)
+
+
+def test_appearance_change_does_not_touch_the_wiring(offline_demo):
+    """外観だけの変更で、配線（inputs/outputs）は P5.2 のまま。"""
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+
+    # 6ハンドラが健在で、State を受けて State を返す形も変わらない
+    for api_name in (
+        "on_custom_add", "on_custom_up", "on_custom_down",
+        "on_custom_remove", "on_custom_clear", "on_custom_start",
+    ):
+        fn = by_api[api_name]
+        assert type(fn.inputs[0]).__name__ == "State"
+        assert type(fn.outputs[0]).__name__ == "State"
+    assert len(by_api["on_custom_add"].inputs) == 2   # State ＋ 候補ドロップダウン
+    assert len(by_api["on_custom_clear"].inputs) == 1  # State だけ
+    assert len(by_api["on_videos_tick"].outputs) == 4  # 契約は不変

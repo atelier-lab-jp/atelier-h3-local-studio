@@ -236,6 +236,21 @@ class VideoRow:
 
 
 @dataclass(frozen=True)
+class CompletedSummary:
+    """③完成・編集タブの要約（P5.3-A）。長い一覧表の代わりに件数だけを出す。"""
+
+    total: int
+    clips: int
+    chain_concats: int
+    manual_concats: int
+    missing: int
+
+    @property
+    def concats(self) -> int:
+        return self.chain_concats + self.manual_concats
+
+
+@dataclass(frozen=True)
 class ContinuationContext:
     """「この動画の続きを作る」で UI へ渡す継続元の情報（不変）。"""
 
@@ -817,6 +832,34 @@ class AppService:
             reverse=True,
         )
         return rows
+
+    def completed_summary(self) -> "CompletedSummary":
+        """③完成・編集タブの要約（P5.3-A）。長い一覧表の代わりに件数だけを出す。
+
+        `completed_videos()` と**同じ行**を数えるので、画面の件数と選択候補が
+        食い違わない（別々に数え直すと必ずずれる）。
+        """
+        rows = self.completed_videos()
+        clips = sum(1 for r in rows if r.kind == "clip")
+        chains = sum(1 for r in rows if r.concat_kind == "chain")
+        manuals = sum(1 for r in rows if r.concat_kind == "manual")
+        missing = sum(1 for r in rows if not r.exists)
+        return CompletedSummary(
+            total=len(rows),
+            clips=clips,
+            chain_concats=chains,
+            manual_concats=manuals,
+            missing=missing,
+        )
+
+    def concat_product_rows(self) -> list[VideoRow]:
+        """連結成果物だけを新しい順で返す（④履歴タブの「連結成果物」フィルタ用）。
+
+        ③から一覧表を無くしたため、チェーン連結（`c_*`）と指定順連結（`cm_*`）を
+        表で見られる場所が④だけになる。出どころは違うが `VideoRow` に揃っている
+        ので、ここでも `completed_videos()` の結果を絞るだけで済む。
+        """
+        return [r for r in self.completed_videos() if r.kind == "concat"]
 
     def concat_candidates(self) -> list[VideoRow]:
         """指定順連結（P5.2）の素材にできる動画だけを新しい順で返す。
