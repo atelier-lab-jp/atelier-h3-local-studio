@@ -259,6 +259,81 @@ FINDER_NOTE = (
     "「ビデオを保存」を選んでください。"
 )
 
+#: 指定順連結（P5.2）。本数の範囲は下位層（history / concat_manifest）と同じ値。
+#: UI は入口で親切に止めるだけで、**最終的な判定は必ずサーバ側が行う**。
+MIN_CUSTOM_CLIPS = 2
+MAX_CUSTOM_CLIPS = 20
+CUSTOM_CONCAT_TITLE = "複数の動画を選んで連結（順番指定）"
+CUSTOM_CONCAT_LABEL = "▶ この順番で連結（2本以上選んでください）"
+
+
+# --------------------------------------------- 指定順連結の並び操作（純粋関数）
+#
+# 並びを変える処理は**すべてここに置く**。サービスにも画面にも触れず、
+# 「今の並び → 新しい並びと日本語メッセージ」だけを返すので、単体で試験できる。
+# 画面はこの結果から毎回組み立て直す（`gr.State` の中身がそのまま入力になる）。
+
+
+def custom_order_add(
+    order: list[str], job_id: str, known_ids: set[str]
+) -> tuple[list[str], str]:
+    """候補へ1本足す。重複・上限・一覧に無いIDはここで断る。"""
+    order = [str(v) for v in (order or [])]
+    target = str(job_id or "").strip()
+    if not target:
+        return order, "⚠️ 追加する動画を選んでください。"
+    if target in order:
+        return order, (
+            f"⚠️ `{target}` はすでに連結候補に入っています"
+            "（同じ動画は1回だけ使えます）。"
+        )
+    if len(order) >= MAX_CUSTOM_CLIPS:
+        return order, (
+            f"⚠️ 一度に連結できるのは {MAX_CUSTOM_CLIPS} 本までです"
+            "（不要な動画を削除してから追加してください）。"
+        )
+    if known_ids is not None and target not in known_ids:
+        return order, f"⚠️ `{target}` は連結できる個別動画の一覧にありません。"
+    order = order + [target]
+    return order, f"✅ `{target}` を {len(order)} 番目に追加しました。"
+
+
+def custom_order_move(order: list[str], job_id: str, delta: int) -> tuple[list[str], str]:
+    """対象を1つ上（-1）／下（+1）へ動かす。端では動かさずに理由を返す。"""
+    order = [str(v) for v in (order or [])]
+    target = str(job_id or "").strip()
+    if not target:
+        return order, "⚠️ 動かす動画を「対象を選ぶ」から選んでください。"
+    if target not in order:
+        return order, f"⚠️ `{target}` は連結候補に入っていません。"
+    index = order.index(target)
+    new_index = index + delta
+    if new_index < 0:
+        return order, f"⚠️ `{target}` はすでに1番目です。"
+    if new_index >= len(order):
+        return order, f"⚠️ `{target}` はすでに最後です。"
+    moved = list(order)
+    moved[index], moved[new_index] = moved[new_index], moved[index]
+    return moved, f"✅ `{target}` を {new_index + 1} 番目に移動しました。"
+
+
+def custom_order_remove(order: list[str], job_id: str) -> tuple[list[str], str]:
+    order = [str(v) for v in (order or [])]
+    target = str(job_id or "").strip()
+    if not target:
+        return order, "⚠️ 削除する動画を「対象を選ぶ」から選んでください。"
+    if target not in order:
+        return order, f"⚠️ `{target}` は連結候補に入っていません。"
+    return [j for j in order if j != target], f"✅ `{target}` を連結候補から外しました。"
+
+
+def custom_order_clear(order: list[str]) -> tuple[list[str], str]:
+    """候補リストを空にするだけ。**実行中の連結は取り消さない**。"""
+    had = len(order or [])
+    if not had:
+        return [], "連結候補はもともと空です。"
+    return [], f"✅ 連結候補（{had}本）をすべて解除しました。"
+
 #: 未選択のときに③④の右側へ出す案内文。**選択欄の位置とボタン名がタブごとに違う**
 #: ため、共通化せず別々に持つ（P5.1: ③は選択欄を一覧の上へ移した）。
 VIDEOS_EMPTY_NOTE = (
@@ -420,6 +495,10 @@ def _cell(text: object) -> str:
 
 
 def _seed_cell(row) -> str:
+    # 指定順連結の成果物には seed という概念が無い（複数動画をつないだ結果なので、
+    # 1つの値に決まらない）。「ランダム」と出すと誤解を招くので伏せる。
+    if getattr(row, "concat_kind", None) == "manual":
+        return "—"
     used = getattr(row, "seed_used", None)
     requested = getattr(row, "seed_requested", None)
     if used is not None:
@@ -855,6 +934,9 @@ def build_ui(
     _has_concat = hasattr(service, "start_concat")
     _has_concat_status = hasattr(service, "concat_status")
     _has_reveal = hasattr(service, "reveal_in_finder")
+    # P5.2: 指定順連結。サービス側が未対応でも③タブは今までどおり動く
+    _has_custom_concat = hasattr(service, "start_custom_concat")
+    _has_concat_candidates = hasattr(service, "concat_candidates")
 
     def _submit_accepts_continuation() -> bool:
         """`submit_generation` が parent_id / keyframe_path を受けるか調べる。"""
@@ -1100,6 +1182,10 @@ def build_ui(
         """③タブの Timer 表示。スナップショットは1 tick に**1回だけ**取得する。
 
         一覧と連結状態は別々に例外を握る（片方が壊れてももう片方は出し続ける）。
+
+        **戻り値は4つ**（P5.2 で末尾に「指定順連結の候補」を追加した）。
+        既存の3つの順番は変えていない。候補は `choices` だけを更新するので、
+        ユーザーが選びかけている値も、編集中の並びも Timer では壊れない。
         """
         try:
             rows = _completed_rows()
@@ -1113,7 +1199,12 @@ def build_ui(
         except Exception:  # 設計書 §13.2
             log.exception("連結の状態を取得できませんでした")
             concat = "### 連結の状態\n⚠️ 状態を取得できません（「詳しい情報（アプリの動作ログ）」をご確認ください）"
-        return listing, choices, concat
+        try:
+            clip_choices = _clip_choices()
+        except Exception:  # 設計書 §13.2
+            log.exception("指定順連結の候補を取得できませんでした")
+            clip_choices = gr.update()
+        return listing, choices, concat, clip_choices
 
     def _history_view(filter_label) -> tuple:
         """④タブの Timer 表示。スナップショットは1 tick に**1回だけ**取得する。"""
@@ -1537,6 +1628,149 @@ def build_ui(
     def on_start_concat(key):
         return _concat_message(key), _concat_status_text()
 
+    # ------------------------------------------- ③指定順連結（P5.2・設計書 §23）
+    #
+    # 連結候補の並びは `gr.State(list[str])` に持つ＝**ブラウザセッションごと**。
+    # Mac と iPhone で同時に開いても互いの選択は混ざらない（実行だけはサーバ側の
+    # ConcatService が全体で1本に排他する）。並びを変える関数はすべて
+    # 「今の並び＋対象 → 新しい並び」の純粋関数にしてあり、画面は毎回そこから
+    # 組み立て直す。**Timer の outputs にこれらを一切入れない**ので、
+    # 1秒ごとの更新でユーザーが編集中の順番が壊れることがない。
+
+    def _clip_rows() -> list:
+        """指定順連結の素材にできる行（成功した個別動画のみ）。"""
+        if not _has_concat_candidates:
+            return [r for r in _completed_rows() if _attr(r, "kind", "clip") == "clip"]
+        try:
+            return list(service.concat_candidates())
+        except Exception:  # 設計書 §13.2
+            log.exception("連結候補の取得に失敗しました")
+            return []
+
+    def _clip_choices():
+        """候補ドロップダウンの選択肢（値は job_id そのもの）。"""
+        choices = []
+        for row in _clip_rows():
+            job_id = _attr(row, "job_id", "")
+            label = (
+                f"{job_id} ｜ {_fmt_dt(getattr(row, 'created_at', None))}"
+                f" ｜ {_attr(row, 'duration_label', '—')}"
+            )
+            if not _attr(row, "exists", False):
+                label += " ｜ ファイルなし"
+            choices.append((label, job_id))
+        return gr.update(choices=choices)
+
+    def _order_choices(order: list[str]):
+        """「対象を選ぶ」の選択肢。**現在の並び順のまま**番号を振る。"""
+        rows = {_attr(r, "job_id", ""): r for r in _clip_rows()}
+        choices = []
+        for i, job_id in enumerate(order, start=1):
+            row = rows.get(job_id)
+            length = _attr(row, "duration_label", "—") if row else "—"
+            choices.append((f"{i}. {job_id} ｜ {length}", job_id))
+        return gr.update(choices=choices, value=None)
+
+    def _order_text(order: list[str]) -> str:
+        """現在の連結順（番号付き）。合計本数と合計時間も出す。"""
+        if not order:
+            return (
+                "### 現在の連結順\n"
+                "まだ選ばれていません。上の欄で動画を選んで"
+                "［連結候補へ追加］を押してください（2本以上で連結できます）。"
+            )
+        rows = {_attr(r, "job_id", ""): r for r in _clip_rows()}
+        lines = [f"### 現在の連結順（{len(order)}本）"]
+        total_frames = 0
+        for i, job_id in enumerate(order, start=1):
+            row = rows.get(job_id)
+            if row is None:
+                lines.append(f"{i}. `{job_id}` ⚠️ 一覧に見つかりません")
+                continue
+            total_frames += int(_attr(row, "num_frames", 0) or 0)
+            missing = "" if _attr(row, "exists", False) else " ⚠️ ファイルなし"
+            lines.append(
+                f"{i}. `{job_id}` ｜ {_attr(row, 'duration_label', '—')}"
+                f" ｜ {_fmt_dt(getattr(row, 'created_at', None))}{missing}"
+            )
+        if total_frames:
+            lines.append(f"\n合計 **{len(order)}本・約{total_frames / FIXED_FPS:.1f}秒**")
+        return "\n".join(lines)
+
+    def _concat_button_label(order: list[str]) -> str:
+        if len(order) < MIN_CUSTOM_CLIPS:
+            return CUSTOM_CONCAT_LABEL
+        rows = {_attr(r, "job_id", ""): r for r in _clip_rows()}
+        frames = sum(
+            int(_attr(rows.get(j), "num_frames", 0) or 0) for j in order if j in rows
+        )
+        seconds = frames / FIXED_FPS if frames else 0
+        return f"▶ この順番で連結（{len(order)}本・約{seconds:.1f}秒）"
+
+    def _custom_view(order: list[str], message: str = "") -> tuple:
+        """並びから画面を組み立て直す（全ハンドラ共通の戻り値）。"""
+        return (
+            list(order),
+            _order_text(order),
+            _order_choices(order),
+            gr.update(value=_concat_button_label(order)),
+            message,
+        )
+
+    def on_custom_add(order, job_id):
+        known = {_attr(r, "job_id", "") for r in _clip_rows()}
+        return _custom_view(*custom_order_add(order, job_id, known))
+
+    def on_custom_up(order, job_id):
+        return _custom_view(*custom_order_move(order, job_id, -1))
+
+    def on_custom_down(order, job_id):
+        return _custom_view(*custom_order_move(order, job_id, 1))
+
+    def on_custom_remove(order, job_id):
+        return _custom_view(*custom_order_remove(order, job_id))
+
+    def on_custom_clear(order):
+        return _custom_view(*custom_order_clear(order))
+
+    def on_custom_start(order):
+        """指定順の連結を開始する（送るのはジョブIDの並びだけ）。"""
+        order = [str(v) for v in (order or [])]
+        if len(order) < MIN_CUSTOM_CLIPS:
+            return (
+                *_custom_view(
+                    order,
+                    f"⚠️ 連結するには {MIN_CUSTOM_CLIPS} 本以上を選んでください"
+                    f"（いまは {len(order)} 本）。",
+                ),
+                _concat_status_text(),
+            )
+        if not _has_custom_concat:
+            return (*_custom_view(order, f"⚠️ {_UNSUPPORTED}"), _concat_status_text())
+
+        previous_key = _concat_key()
+        try:
+            result = service.start_custom_concat(order)
+        except Exception:  # 設計書 §13.2
+            log.exception("指定順の連結を開始できませんでした: %s", order)
+            return (
+                *_custom_view(order, f"❌ 連結を開始できませんでした{_LOG_HINT}"),
+                _concat_status_text(),
+            )
+
+        failure = _immediate_concat_failure(previous_key)
+        if failure:
+            return (*_custom_view(order, f"❌ {failure}"), _concat_status_text())
+        message = (
+            result
+            if any(ord(ch) > 127 for ch in str(result))
+            else f"▶ {len(order)}本の連結を開始しました。"
+        )
+        return (
+            *_custom_view(order, f"▶ {message}"),
+            _concat_status_text(),
+        )
+
     def _reveal_target(kind: str, job_id: str):
         """Finder へ渡す対象を**サーバ側で解決**して返す（見つからなければ None）。
 
@@ -1923,6 +2157,45 @@ def build_ui(
                         videos_list_md = gr.Markdown(
                             initial_videos[0], elem_classes=["h3-scroll"]
                         )
+
+                        # ---- P5.2: 指定順連結（既定は閉じておく。既存操作を隠さない）
+                        with gr.Accordion(CUSTOM_CONCAT_TITLE, open=False):
+                            gr.Markdown(
+                                "好きな動画を好きな順番でつなげます。"
+                                "**上から順に**再生される1本の動画になります"
+                                f"（{MIN_CUSTOM_CLIPS}〜{MAX_CUSTOM_CLIPS}本・"
+                                "元の動画はそのまま残ります）。",
+                                elem_classes=["h3-note"],
+                            )
+                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                                custom_pick = gr.Dropdown(
+                                    choices=[],
+                                    value=None,
+                                    label="追加する動画を選ぶ（個別動画のみ）",
+                                    allow_custom_value=True,
+                                    interactive=True,
+                                )
+                                custom_add_btn = gr.Button("＋ 連結候補へ追加", size="sm")
+                            custom_order_md = gr.Markdown(_order_text([]))
+                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                                custom_target = gr.Dropdown(
+                                    choices=[],
+                                    value=None,
+                                    label="対象を選ぶ（順番の入れ替え・削除）",
+                                    allow_custom_value=True,
+                                    interactive=True,
+                                )
+                                custom_up_btn = gr.Button("↑ 上へ", size="sm")
+                                custom_down_btn = gr.Button("↓ 下へ", size="sm")
+                                custom_remove_btn = gr.Button("－ 削除", size="sm")
+                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                                custom_clear_btn = gr.Button(
+                                    "選択をすべて解除", size="sm", variant="secondary"
+                                )
+                                custom_start_btn = gr.Button(
+                                    CUSTOM_CONCAT_LABEL, variant="primary"
+                                )
+                            custom_msg_md = gr.Markdown("")
                     with gr.Column(scale=2):
                         video_player3 = gr.Video(
                             label="プレビュー", interactive=False, autoplay=False
@@ -1992,6 +2265,9 @@ def build_ui(
         latest_state = gr.State("")
         selected_video_state = gr.State("")
         selected_history_state = gr.State("")
+        # P5.2: 指定順連結の並び。**ブラウザセッションごと**に独立して持つので、
+        # Mac と iPhone を同時に開いても互いの選択が混ざらない（設計書 §23.5）。
+        custom_order_state = gr.State([])
 
         # 送信は即座に戻る（生成完了を待たない）。継続モードのときは親IDも一緒に渡す。
         #
@@ -2072,7 +2348,14 @@ def build_ui(
         )
 
         # ------------------------------------------------ ③完成動画タブの配線（P4）
-        videos_outputs = [videos_list_md, video_select, concat_status_md]
+        # P5.2 で末尾に custom_pick を追加した（既存3つの順番は変えていない）。
+        # **candidate の choices だけ**を更新するので、編集中の並びには触れない。
+        videos_outputs = [
+            videos_list_md,
+            video_select,
+            concat_status_md,
+            custom_pick,
+        ]
         video_reload_btn.click(
             on_select_video,
             inputs=video_select,
@@ -2090,6 +2373,52 @@ def build_ui(
             inputs=video_select,
             outputs=videos_msg_md,
             api_name="on_reveal_video",
+        )
+
+        # ---- P5.2: 指定順連結。**Timer はこれらの outputs に触れない**ので、
+        # 1秒ごとの更新でユーザーが編集中の並びが巻き戻ることがない。
+        custom_outputs = [
+            custom_order_state,
+            custom_order_md,
+            custom_target,
+            custom_start_btn,
+            custom_msg_md,
+        ]
+        custom_add_btn.click(
+            on_custom_add,
+            inputs=[custom_order_state, custom_pick],
+            outputs=custom_outputs,
+            api_name="on_custom_add",
+        )
+        custom_up_btn.click(
+            on_custom_up,
+            inputs=[custom_order_state, custom_target],
+            outputs=custom_outputs,
+            api_name="on_custom_up",
+        )
+        custom_down_btn.click(
+            on_custom_down,
+            inputs=[custom_order_state, custom_target],
+            outputs=custom_outputs,
+            api_name="on_custom_down",
+        )
+        custom_remove_btn.click(
+            on_custom_remove,
+            inputs=[custom_order_state, custom_target],
+            outputs=custom_outputs,
+            api_name="on_custom_remove",
+        )
+        custom_clear_btn.click(
+            on_custom_clear,
+            inputs=custom_order_state,
+            outputs=custom_outputs,
+            api_name="on_custom_clear",
+        )
+        custom_start_btn.click(
+            on_custom_start,
+            inputs=custom_order_state,
+            outputs=[*custom_outputs, concat_status_md],
+            api_name="on_custom_start",
         )
 
         continuation_outputs = [

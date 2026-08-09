@@ -128,6 +128,11 @@ class AppConfig:
         return self.data_root / "history.json"
 
     @property
+    def concat_manifest_path(self) -> Path:
+        """任意順序連結の成果物台帳（P5.2）。history.json とは別ファイル。"""
+        return self.data_root / "concat_manifest.json"
+
+    @property
     def assets_mock_dir(self) -> Path:
         return self.project_root / "app" / "assets" / "mock"
 

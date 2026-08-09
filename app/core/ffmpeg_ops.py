@@ -131,6 +131,18 @@ def decode_probe(ffmpeg: str, path: Path, timeout: int = 300) -> ProbeResult:
     )
 
 
+def audio_sample_rate_of(probe: ProbeResult) -> int | None:
+    """`decode_probe()` の結果から音声のサンプリング周波数を読み取る（P5.2）。
+
+    履歴スキーマ v1 に音声仕様の欄が無いため（§11.2・スキーマ変更は禁止）、
+    任意順序連結では**実ファイルを見て**音声仕様の一致を確かめる。
+    ffmpeg の `Audio: aac (LC) ..., 32000 Hz, stereo, ...` 行から読む。
+    読み取れない場合は None（呼び出し側が「確認できない」として扱う）。
+    """
+    match = re.search(r",\s*(\d+)\s*Hz", probe.audio_desc or "")
+    return int(match.group(1)) if match else None
+
+
 def video_validator(
     ffmpeg: str,
     expected_duration_sec: float | None,

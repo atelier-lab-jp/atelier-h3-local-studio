@@ -222,6 +222,10 @@ class VideoRow:
     error: str | None
     error_category: str | None
     execution_engine: str
+    #: 連結行の内部種別（P5.2）: "chain"（ルートからの連結） | "manual"（指定順連結）。
+    #: 個別動画では None。**表示上はどちらも「連結」だが記録先が違う**
+    #: （chain＝履歴の concat_path ／ manual＝concat_manifest.json）ため内部では必ず区別する。
+    concat_kind: str | None = None
 
     @property
     def label(self) -> str:
@@ -290,8 +294,22 @@ class AppService:
         self._submit_clock = time.monotonic
         self._submit_lock = threading.Lock()
         self._recent_submits: dict[str, tuple[float, JobView]] = {}
-        # 連結サービス（P4）。ffmpeg レーンは生成キューと別（設計書 §7 決定D5）
+        # 任意順序連結の台帳（P5.2）。history.json とは独立したファイル（設計書 §23）
+        self.concat_manifest = self._make_concat_manifest()
+        # 連結サービス（P4/P5.2）。ffmpeg レーンは生成キューと別（設計書 §7 決定D5）
         self._concat = self._make_concat_service()
+
+    def _make_concat_manifest(self):
+        """台帳を作る。作れなくても UI は起動する（任意連結だけが使えなくなる）。"""
+        try:
+            from app.core.concat_manifest import ConcatManifest
+
+            return ConcatManifest(self.cfg.concat_manifest_path, self.cfg.data_root)
+        except Exception:
+            log.exception(
+                "任意連結の記録先を初期化できませんでした（指定順の連結は無効になります）"
+            )
+            return None
 
     def _make_concat_service(self):
         """連結サービスを作る。利用できない場合も UI を起動できるよう None に落とす。"""
@@ -299,7 +317,10 @@ class AppService:
             from app.core.concat_service import ConcatService
 
             return ConcatService(
-                self.cfg, self.history, ffmpeg_path=self.cfg.ffmpeg_path
+                self.cfg,
+                self.history,
+                ffmpeg_path=self.cfg.ffmpeg_path,
+                manifest=self.concat_manifest,
             )
         except Exception:
             log.exception("連結サービスを初期化できませんでした（連結機能は無効になります）")
@@ -391,6 +412,14 @@ class AppService:
             log.exception("履歴の読み込みに失敗しました")
             warnings.append(f"履歴を読み込めませんでした（{e}）")
             interrupted = 0
+        if self.concat_manifest is not None:
+            # 台帳が壊れていても起動は止めない（任意連結の一覧が空になるだけで、
+            # 作成済みの MP4 は消さない。設計書 §23.5）
+            try:
+                warnings.extend(self.concat_manifest.load())
+            except Exception as e:
+                log.exception("任意連結の記録の読み込みに失敗しました")
+                warnings.append(f"任意連結の記録を読み込めませんでした（{e}）")
         if interrupted:
             warnings.append(
                 f"前回のアプリ終了により中断された生成が {interrupted} 件あります"
@@ -720,10 +749,58 @@ class AppService:
             error=record.error,
             error_category=record.error_category,
             execution_engine=record.execution_engine,
+            concat_kind="chain" if kind == "concat" else None,
         )
 
+    def _manual_concat_row(self, entry) -> VideoRow:
+        """任意順序連結（P5.2）の1行。履歴レコードではなく台帳から作る。
+
+        `job_id` には成果物ID（`cm_...`）が入る。個別動画のID（`v_...`）とは
+        接頭辞が違うので、`kind:job_id` の選択キーが衝突することはない。
+        """
+        path = self.concat_manifest.to_absolute(entry.output_path)
+        return VideoRow(
+            job_id=entry.id,
+            kind="concat",
+            video_path=path,
+            exists=bool(path and path.is_file()),
+            created_at=entry.created_at,
+            duration_label=entry.duration_label,
+            # ステップ・seed は連結成果物には無い概念なので持たせない（画面では「—」）
+            steps=None,
+            num_frames=entry.num_frames_total,
+            seed_requested=None,
+            seed_used=None,
+            prompt_head="",
+            parent_id=None,
+            chain_length=None,
+            backend_id=entry.backend_id,
+            model_revision=entry.model_revision,
+            elapsed_sec=None,
+            concat_sources=tuple(entry.sources),
+            status="success",
+            error=None,
+            error_category=None,
+            execution_engine=entry.execution_engine,
+            concat_kind="manual",
+        )
+
+    def _manual_concat_rows(self) -> list[VideoRow]:
+        """台帳が壊れていても③タブを出し続ける（失敗しても空を返す）。"""
+        if self.concat_manifest is None:
+            return []
+        try:
+            return [self._manual_concat_row(e) for e in self.concat_manifest.list_entries()]
+        except Exception:
+            log.exception("任意連結の一覧を取得できませんでした")
+            return []
+
     def completed_videos(self) -> list[VideoRow]:
-        """③完成動画タブ用。成功した個別動画と、連結済み動画を新しい順で返す。"""
+        """③完成動画タブ用。個別動画・チェーン連結・指定順連結を新しい順で返す。
+
+        3つの出どころを1つの表示用一覧へ合流させる唯一の場所（設計書 §23.3）。
+        ここから下（UI）は VideoRow だけを見ればよく、記録先の違いを知らない。
+        """
         from app.core.contracts import JobStatus
 
         rows: list[VideoRow] = []
@@ -733,7 +810,21 @@ class AppService:
             rows.append(self._row(rec, "clip"))
             if rec.concat_path:
                 rows.append(self._row(rec, "concat"))
+        rows.extend(self._manual_concat_rows())
+        # 出どころが混ざるので、合流後に必ず新しい順へ並べ直す
+        rows.sort(
+            key=lambda r: (r.created_at is not None, r.created_at, r.job_id),
+            reverse=True,
+        )
         return rows
+
+    def concat_candidates(self) -> list[VideoRow]:
+        """指定順連結（P5.2）の素材にできる動画だけを新しい順で返す。
+
+        **成功した個別動画のみ**。連結成果物（チェーン・指定順とも）は含めない
+        ので、UI の候補一覧に出た時点で「素材にできないものが選ばれる」経路が無い。
+        """
+        return [r for r in self.completed_videos() if r.kind == "clip"]
 
     def history_rows(self, status: str | None = None) -> list[VideoRow]:
         """④履歴タブ用。全状態（QUEUED/RUNNING の残存も含む）を新しい順で返す。"""
@@ -745,6 +836,18 @@ class AppService:
         return rows
 
     def find_row(self, job_id: str, kind: str = "clip") -> VideoRow | None:
+        """IDから1行を引く。`cm_...` は台帳から、それ以外は履歴から解決する。
+
+        ブラウザから来るのは選択キー（`kind:job_id`）だけなので、
+        **パスの解決はここから下（サーバ側）でしか行わない**（設計書 §15）。
+        """
+        from app.core.naming import is_valid_manual_concat_id
+
+        if kind == "concat" and is_valid_manual_concat_id(str(job_id)):
+            if self.concat_manifest is None:
+                return None
+            entry = self.concat_manifest.get(str(job_id))
+            return self._manual_concat_row(entry) if entry is not None else None
         rec = self.history.get(job_id)
         return self._row(rec, kind) if rec is not None else None
 
@@ -847,6 +950,22 @@ class AppService:
             log.warning("連結を開始できませんでした: %s（%s）", job_id, e)
             return f"連結を開始できませんでした: {e}"
         return "連結を開始しました。進行状況は下に表示されます。"
+
+    def start_custom_concat(self, job_ids) -> str:
+        """指定された順番で連結する（P5.2・バックグラウンド開始・日本語メッセージ）。
+
+        UI から受け取るのはジョブIDの並びだけ。検証もパス解決も下位層で行う。
+        """
+        if self._concat is None:
+            return "連結機能を利用できません"
+        ids = [str(v).strip() for v in (job_ids or [])]
+        try:
+            self._concat.start_custom_concat(ids)
+        except Exception as e:
+            # ConcatError（本数・実行中など）も内部障害も、UI へは日本語で返す
+            log.warning("指定順の連結を開始できませんでした: %s（%s）", ids, e)
+            return f"連結を開始できませんでした: {e}"
+        return f"{len(ids)}本を指定した順番で連結します。進行状況は下に表示されます。"
 
     def concat_status(self):
         return self._concat.status() if self._concat is not None else None

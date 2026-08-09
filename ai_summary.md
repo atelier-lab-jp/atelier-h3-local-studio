@@ -1,11 +1,29 @@
 # ai_summary.md — 現在状態の正本
 
 > この文書は「最新状態の正本」であり、過去ログは積まず常に現在地を表すよう上書き更新する。
-> 経緯は `changelog.md`、恒久ルールは `CLAUDE.md`、設計は `docs/v1-design.md`（v1.5）を参照。
+> 経緯は `changelog.md`、恒久ルールは `CLAUDE.md`、設計は `docs/v1-design.md`（v1.6）を参照。
 
 - **最終更新日**: 2026-08-09
 - **プロジェクトの目的**: Mac mini（M4・24GB・MPS）上で動く完全ローカルの音声付き動画生成アプリ。初心者がブラウザ（Gradio・日本語UI・localhost限定）から MiniMax-H3 動画を生成できるようにする。
-- **現在フェーズ**: **P5.1 完了。V1.0.0 Release Candidate（実iPhoneでの最終確認待ち）**
+- **現在フェーズ**: **P5.2 完了。V1.0.0 Release Candidate（実iPhoneでの最終確認待ち）**
+
+## P5.2 で入れた任意順序連結（2026-08-09）
+
+好きな動画を好きな順番でつなぐ機能。**生成エンジン・キュー契約・履歴スキーマは無変更**。
+設計は `docs/v1-design.md` §23（決定D18）。
+
+- **成果物は専用台帳** `data/concat_manifest.json` へ記録する（`history.json` は1バイトも変えない）。
+  チェーン連結の `concat_path` は1レコード1件しか持てず、A→B→C と A→D→C のような
+  別の組み合わせで**上書き**が起きるため。旧版互換も壊さない
+- **台帳の保存規律は HistoryStore と同じ** — 一意tmp→fsync→`os.replace()`／検証済み primary のみ
+  `.bak` 更新／破損は隔離／`.bak` も検証してから復旧／両方壊れても**MP4 は消さない**
+- **昇格後に台帳保存が失敗したら正式 MP4 をロールバック削除**（できなければ隔離、
+  それも無理なら正確なパスをログへ）。孤児 MP4 を残さない
+- **チェーン連結と同じ `ConcatService`** に第2の入口を足したので、両者は自動的に相互排他
+- 入力は**ジョブIDの並びだけ**。実行スレッド内で9項目を再検証し、**指定順をそのまま**使う
+  （互換性はチェーンの上位集合。音声仕様だけは実ファイルを見て判定）
+- UI は③タブの初期 closed な折りたたみ。並びは `gr.State`＝**セッション独立**で、
+  Timer は候補の choices しか触らないため編集中の順番が壊れない
 
 ## P5.1 で入れた UI 改修（2026-08-09・小規模）
 
@@ -133,7 +151,7 @@
 
 ## テスト結果（最新）
 
-- **1007 passed + 1 xpassed**（P4 時点は 625+1。P5 で 367 件、P5.1 で 15 件追加）
+- **1144 passed + 1 xpassed**（P4 時点は 625+1。P5 で 367 件、P5.1 で 15 件、P5.2 で 137 件追加）
   - キュー 70／RealEngine 50／MockEngine 41／ワーカー 163／P2統合 13／UI経路 17／履歴 38／P1結合 10／基盤系ほか
 - `setup.sh` 成功、`start.sh --check`（mock/real/deep-check）合格、`--smoke` HTTP 200
 - **ブラウザ相当の実配信検証**: 動画は HTTP 206・`video/mp4` で配信、履歴JSON/ログ/data_root外は 403 拒否
@@ -232,7 +250,7 @@ tests/                   388テスト（実モデルは使わない）
 
 1. `CLAUDE.md` の絶対制約（DiffSynth 読み取り専用・V1固定仕様・フェーズ境界）
 2. 本書の「V1 完成後の状態」と「残っている警告・未解決事項」
-3. `.venv/bin/python -m pytest tests/ -q` が **1007 passed + 1 xpassed** であること
+3. `.venv/bin/python -m pytest tests/ -q` が **1144 passed + 1 xpassed** であること
 4. `./scripts/start.sh --check --mode real --deep-check` が合格すること（実機資産が揃っているか）
 5. 設計書 §22.2（バックエンド契約）・付録A（ワーカープロトコルと A.1 の2層構造）・§10.7（原子的保存）・§13.3（fatal 分類）— P2 実装の直接仕様
 6. `app/core/contracts.py` — 全層の契約。ここを変えると全層に波及するので慎重に

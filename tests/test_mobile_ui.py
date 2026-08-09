@@ -890,3 +890,145 @@ def test_history_tab_keeps_its_own_guidance(ui_config, mobile_app):
     # ④のボタン名は「記録」。③の「選んだ動画を表示」を案内してはいけない
     history_btn = _only(_by_value(ui_config, "button", "↻ 選んだ記録を表示"), "履歴の表示ボタン")
     assert history_btn is not None
+
+
+# ------------------------------------------------- P5.2 指定順連結（③タブ）
+
+
+def test_custom_concat_accordion_exists_and_starts_closed(ui_config):
+    """既存の操作を隠さないよう、初期状態は閉じている。"""
+    accordions = [
+        a
+        for a in _components(ui_config, "accordion")
+        if "複数の動画を選んで連結" in str(a.get("props", {}).get("label") or "")
+    ]
+    assert len(accordions) == 1, "指定順連結の折りたたみが1つだけ存在するはず"
+    assert accordions[0]["props"].get("open") is False
+
+
+def test_custom_concat_controls_are_present_once(ui_config):
+    """追加・上下移動・削除・全解除・実行のボタンが1組だけある。"""
+    for text in (
+        "＋ 連結候補へ追加",
+        "↑ 上へ",
+        "↓ 下へ",
+        "－ 削除",
+        "選択をすべて解除",
+    ):
+        _only(_by_value(ui_config, "button", text), f"{text} ボタン")
+    _only(
+        [
+            b
+            for b in _components(ui_config, "button")
+            if str(b.get("props", {}).get("value") or "").startswith("▶ この順番で連結")
+        ],
+        "実行ボタン",
+    )
+    _only(_by_label(ui_config, "dropdown", "追加する動画を選ぶ"), "候補ドロップダウン")
+    _only(_by_label(ui_config, "dropdown", "対象を選ぶ"), "対象ドロップダウン")
+
+
+def test_custom_concat_is_separate_from_the_view_selector(ui_config):
+    """既存の「表示する動画を選ぶ」と別の操作領域になっている（取り違え防止）。"""
+    view_selector = _only(
+        _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "表示用選択欄"
+    )
+    add_selector = _only(_by_label(ui_config, "dropdown", "追加する動画を選ぶ"), "候補選択欄")
+    assert view_selector["id"] != add_selector["id"]
+
+    parents = _parents(ui_config)
+    # 候補選択欄だけが Accordion の中にある
+    accordion_ids = {
+        a["id"]
+        for a in _components(ui_config, "accordion")
+        if "複数の動画を選んで連結" in str(a.get("props", {}).get("label") or "")
+    }
+
+    def ancestors(component_id):
+        seen = []
+        while component_id in parents:
+            component_id = parents[component_id]
+            seen.append(component_id)
+        return set(seen)
+
+    assert ancestors(add_selector["id"]) & accordion_ids
+    assert not (ancestors(view_selector["id"]) & accordion_ids)
+
+
+def test_custom_concat_rows_stack_and_keep_44px_on_iphone(ui_config):
+    """1カラム化（h3-row）と 44px タップ領域（h3-tap）を全操作行が持つ。"""
+    by_id = {c["id"]: c for c in ui_config["components"]}
+    parents = _parents(ui_config)
+    for text in ("＋ 連結候補へ追加", "↑ 上へ", "↓ 下へ", "－ 削除", "選択をすべて解除"):
+        button = _only(_by_value(ui_config, "button", text), f"{text} ボタン")
+        row = by_id[parents[button["id"]]]
+        assert {"h3-row", "h3-tap"} <= set(_classes(row)), text
+
+
+def test_timer_never_touches_the_custom_concat_order(offline_demo):
+    """Timer の outputs に State・現在順・対象欄・実行ボタンが入っていない。
+
+    ここが崩れると、1秒ごとの更新でユーザーが編集中の並びが巻き戻る。
+    """
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    tick_outputs = by_api["on_videos_tick"].outputs
+
+    # 末尾に足したのは「候補ドロップダウン」だけ
+    assert len(tick_outputs) == 4
+    assert "追加する動画を選ぶ" in str(getattr(tick_outputs[3], "label", ""))
+
+    labels = [str(getattr(o, "label", "") or "") for o in tick_outputs]
+    assert not any("対象を選ぶ" in label for label in labels)
+    types = {type(o).__name__ for o in tick_outputs}
+    assert "State" not in types, "Timer が State を上書きしています"
+    assert "Button" not in types, "Timer が実行ボタンを上書きしています"
+
+    # 他の Timer ハンドラも同様に State を触らない
+    for api_name in ("on_tick", "on_queue_tick", "on_history_tick"):
+        assert "State" not in {
+            type(o).__name__ for o in by_api[api_name].outputs
+        } or api_name == "on_tick"
+
+
+def test_custom_concat_order_state_is_a_session_state(offline_demo):
+    """並びは `gr.State`＝**ブラウザセッションごと**（サーバ共有ではない）。"""
+    import gradio as gr
+
+    _cfg, _service, demo = offline_demo
+    by_api = {f.api_name: f for f in demo.fns.values()}
+    add = by_api["on_custom_add"]
+    assert isinstance(add.inputs[0], gr.State)
+    assert isinstance(add.outputs[0], gr.State)
+    # 既定値は空リスト（セッション開始時は何も選ばれていない）
+    assert add.inputs[0].value == []
+
+
+def test_custom_concat_handlers_are_wired(offline_demo):
+    """6つの操作がすべて配線されている。"""
+    _cfg, _service, demo = offline_demo
+    names = {f.api_name for f in demo.fns.values()}
+    assert {
+        "on_custom_add",
+        "on_custom_up",
+        "on_custom_down",
+        "on_custom_remove",
+        "on_custom_clear",
+        "on_custom_start",
+    } <= names
+
+
+def test_existing_completed_tab_controls_are_not_regressed(ui_config):
+    """P5.1 までの③タブの操作が、そのまま残っている。"""
+    # ③にだけあるもの
+    _only(_by_value(ui_config, "button", "↻ 選んだ動画を表示"), "表示ボタン")
+    # ③④の両方にあるもの（P4 からの既存仕様）
+    for text in ("この動画の続きを作る", "ルートからここまでを連結", "Finderで表示（Macのみ）"):
+        assert _by_value(ui_config, "button", text), f"{text} ボタンが消えています"
+    # 選択欄は今も一覧より上（P5.1 の配置を維持）
+    order = _display_order(ui_config)
+    select = _only(
+        _by_label(ui_config, "dropdown", "表示する動画を選ぶ（個別／連結）"), "選択欄"
+    )
+    listing = _only(_by_value(ui_config, "markdown", "### 完成した動画"), "一覧")
+    assert order.index(select["id"]) < order.index(listing["id"])

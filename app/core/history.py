@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -38,8 +39,27 @@ from app.core.contracts import (
     JobStatus,
     can_transition,
 )
+from app.core.naming import is_valid_manual_concat_id
 
 SCHEMA_VERSION = 1
+
+#: ジョブIDとして受け付けてよい文字（P5.2）。パス区切り・`..`・制御文字を排除する。
+#: 「本物のIDかどうか」は履歴に実在するかで判定するので、ここでは**危険な文字列を
+#: 通さないこと**だけを見る（チェーン連結と同じ強度に揃える）。
+_SAFE_JOB_ID = re.compile(r"^[0-9A-Za-z_.-]{1,64}$")
+
+
+def is_safe_job_id(job_id: str) -> bool:
+    """ジョブIDとして安全か（パス区切り・`..`・制御文字を含まないか）。
+
+    「実在する本物のIDか」は判定しない（それは履歴を引いて確かめる）。
+    連結の入力検証と台帳の記録検証で**同じ判定**を使う。
+    """
+    return bool(_SAFE_JOB_ID.match(str(job_id))) and ".." not in str(job_id)
+
+
+#: 後方互換の別名（モジュール内部の呼び出し用）
+_is_safe_job_id = is_safe_job_id
 
 #: 起動時中断の既定メッセージ（設計書 §9.1・§17.1）
 INTERRUPTED_MESSAGE = "アプリ終了により中断"
@@ -49,6 +69,10 @@ MAX_CHAIN_DEPTH = 20
 
 #: 連結の最小本数（設計書 §10.6。1本だけの「連結」は意味がない）
 MIN_CONCAT_CLIPS = 2
+
+#: 任意順序連結（P5.2）で一度に選べる最大本数。チェーン深さ上限と揃える。
+#: 20本 × 5.17秒 ≒ 103秒。検証式（§10.6.2）も 20本まで実測で確認済み。
+MAX_CUSTOM_CONCAT_CLIPS = 20
 
 #: 連結チェーン内で一致していなければならない項目（P4契約 §3）。
 #: 表示名は日本語エラーメッセージにそのまま使う。
@@ -60,6 +84,16 @@ CHAIN_COMPAT_FIELDS: tuple[tuple[str, str], ...] = (
     ("width", "幅"),
     ("height", "高さ"),
     ("fps", "fps"),
+)
+
+#: 任意順序連結（P5.2）で一致していなければならない項目。
+#: チェーン連結の項目に `model_revision` と `execution_engine` を**足した上位集合**。
+#: チェーンでは継続生成の投入時検証が両者の一致を既に保証しているが（P4）、
+#: 任意選択では利用者が無関係な動画を並べられるため、ここで明示的に確かめる。
+#: **チェーン側の判定条件は変えない**（既存動作の非回帰を優先）。
+CUSTOM_CONCAT_COMPAT_FIELDS: tuple[tuple[str, str], ...] = CHAIN_COMPAT_FIELDS + (
+    ("model_revision", "モデルの版"),
+    ("execution_engine", "生成方法（実機／お試し）"),
 )
 
 #: 状態の日本語表示（連結エラーメッセージ用）
@@ -849,48 +883,157 @@ class HistoryStore:
             self._ensure_loaded_locked()
             chain = self.resolve_chain(job_id)
 
-            # 1. SUCCESS 以外の混入（未完了・失敗・中断の動画は成果物が無い）
-            bad = [r for r in chain if r.status is not JobStatus.SUCCESS]
-            if bad:
-                detail = "、".join(
-                    f"{r.id}（{_STATUS_LABELS_JA.get(r.status.value, r.status.value)}）"
-                    for r in bad
-                )
-                raise HistoryError(
-                    "連結できません。チェーンに成功していない動画が含まれています: "
-                    f"{detail}"
-                )
+            self._require_all_success(chain, context="チェーンに")
+            self._require_compatible(chain)
+            self._require_outputs_exist(chain)
 
-            # 2. 互換性（解像度・fps・モデルが混在した動画をつながない）
-            root = chain[0]
-            for rec in chain[1:]:
-                for field_name, label in CHAIN_COMPAT_FIELDS:
-                    expected = getattr(root, field_name)
-                    actual = getattr(rec, field_name)
-                    if expected != actual:
-                        raise HistoryError(
-                            f"連結できません。{label}が一致しません"
-                            f"（{root.id}: {expected} / {rec.id}: {actual}）"
-                        )
-
-            # 3. 成果物の欠損（どのIDが欠けているかを必ず示す）
-            missing: list[str] = []
-            for rec in chain:
-                absolute = self.to_absolute(rec.output_path)
-                if absolute is None or not absolute.is_file():
-                    missing.append(rec.id)
-            if missing:
-                raise HistoryError(
-                    "連結できません。動画ファイルが見つかりません: " + "、".join(missing)
-                )
-
-            # 4. 本数（root 単体を選んだ場合はここで止まる）
+            # 本数（root 単体を選んだ場合はここで止まる）
             if len(chain) < MIN_CONCAT_CLIPS:
                 raise HistoryError(
                     f"連結には2本以上の動画が必要です（{job_id} は継続元がありません）"
                 )
 
             return chain
+
+    # ------------------------------------------------------------ 連結の共通検証
+    #
+    # チェーン連結（resolve_concat_chain）と任意順序連結（resolve_custom_concat）で
+    # **同じ判定・同じ日本語文言**を使うための共通部品（P5.2）。
+    # チェーン固有の親探索・循環検出は resolve_chain() にだけ残してある。
+
+    @staticmethod
+    def _require_all_success(records: list[HistoryRecord], *, context: str) -> None:
+        """全件が SUCCESS であること（未完了・失敗・中断は成果物が無い）。"""
+        bad = [r for r in records if r.status is not JobStatus.SUCCESS]
+        if bad:
+            detail = "、".join(
+                f"{r.id}（{_STATUS_LABELS_JA.get(r.status.value, r.status.value)}）"
+                for r in bad
+            )
+            raise HistoryError(
+                f"連結できません。{context}成功していない動画が含まれています: {detail}"
+            )
+
+    @staticmethod
+    def _require_compatible(
+        records: list[HistoryRecord],
+        fields: tuple[tuple[str, str], ...] = CHAIN_COMPAT_FIELDS,
+    ) -> None:
+        """解像度・fps・モデル・実行方式が混在した動画をつながない。
+
+        比較の基準は先頭のレコード。任意順序連結では「先頭＝ユーザーが最初に
+        並べた動画」になるが、全件が一致していなければならない点は同じ。
+        検査する項目だけを引数で切り替える（判定と文言は1つに保つ）。
+        """
+        head = records[0]
+        for rec in records[1:]:
+            for field_name, label in fields:
+                expected = getattr(head, field_name)
+                actual = getattr(rec, field_name)
+                if expected != actual:
+                    raise HistoryError(
+                        f"連結できません。{label}が一致しません"
+                        f"（{head.id}: {expected} / {rec.id}: {actual}）"
+                    )
+
+    def _require_outputs_exist(self, records: list[HistoryRecord]) -> None:
+        """成果物が data_root 内に通常ファイルとして実在すること。"""
+        missing: list[str] = []
+        for rec in records:
+            absolute = self.to_absolute(rec.output_path)
+            if absolute is None or not absolute.is_file():
+                missing.append(rec.id)
+        if missing:
+            raise HistoryError(
+                "連結できません。動画ファイルが見つかりません: " + "、".join(missing)
+            )
+
+    def resolve_custom_concat(self, job_ids: Iterable[str]) -> list[HistoryRecord]:
+        """任意順序連結の入力を検証し、**指定された順のまま**返す（P5.2・設計書 §23.2）。
+
+        `resolve_concat_chain()` と違い親子関係を一切見ない。代わりに
+        「ユーザーが選んだ任意の並び」が連結してよいものかを確かめる。
+        **並べ替えは絶対にしない**（作成日時順・ID順へ整えると、ユーザーが
+        指定した順番と成果物が食い違う）。
+
+        検証順序（ユーザーにとって直せる順）:
+          1. ID の形式（手編集・でたらめな値を弾く）
+          2. 重複していないこと
+          3. 本数が 2〜20 本
+          4. 履歴に実在すること
+          5. 全件が SUCCESS
+          6. 全件が個別動画であること（連結成果物は素材にできない）
+          7. backend / model / revision / 実行方式 / 幅 / 高さ / fps の一致
+          8. 成果物が data_root 内に実在すること
+        """
+        ids = [str(v).strip() for v in job_ids]
+
+        # 1. ID の安全性（履歴を引く前に弾く）。
+        #    ここで見るのは「危険な文字列でないこと」だけで、本人確認は
+        #    4.（履歴に実在するか）が行う。形式を `v_日付_時刻_乱数` に限定すると
+        #    チェーン連結より厳しくなり、同じ履歴なのに一方だけ連結できない
+        #    という不整合が生まれるため、そこまでは要求しない。
+        malformed = [i for i in ids if not _is_safe_job_id(i)]
+        if malformed:
+            raise HistoryError(
+                "連結できません。動画IDの形式が正しくありません: "
+                + "、".join(i if i else "（空）" for i in malformed)
+            )
+
+        # 1b. 連結成果物（`cm_...`）は素材にできない。実在検査でも弾かれるが、
+        #     理由が伝わる文言で先に断る。
+        products = [i for i in ids if is_valid_manual_concat_id(i)]
+        if products:
+            raise HistoryError(
+                "連結できません。連結した動画は素材にできません"
+                "（個別の動画だけを選んでください）: " + "、".join(products)
+            )
+
+        # 2. 重複（同じ動画を2回使うのは V1 では禁止）
+        duplicated = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicated:
+            raise HistoryError(
+                "連結できません。同じ動画が複数回選ばれています: " + "、".join(duplicated)
+            )
+
+        # 3. 本数
+        if len(ids) < MIN_CONCAT_CLIPS:
+            raise HistoryError(
+                f"連結には2本以上の動画が必要です（選択: {len(ids)}本）"
+            )
+        if len(ids) > MAX_CUSTOM_CONCAT_CLIPS:
+            raise HistoryError(
+                f"一度に連結できるのは{MAX_CUSTOM_CONCAT_CLIPS}本までです"
+                f"（選択: {len(ids)}本）"
+            )
+
+        with self._lock:
+            self._ensure_loaded_locked()
+
+            # 4. 履歴に実在すること
+            unknown = [i for i in ids if i not in self._records]
+            if unknown:
+                raise HistoryError(
+                    "連結できません。履歴に無い動画が選ばれています: " + "、".join(unknown)
+                )
+            records = [_public(self._records[i]) for i in ids]  # ★ 指定順のまま
+
+            # 5. SUCCESS 以外
+            self._require_all_success(records, context="選んだ動画に")
+
+            # 6. 個別動画のみ（連結成果物・任意連結成果物は素材にできない）
+            not_clips = [r.id for r in records if r.type not in _JOB_TYPES]
+            if not_clips:
+                raise HistoryError(
+                    "連結できません。個別の動画だけを選んでください: "
+                    + "、".join(not_clips)
+                )
+
+            # 7. 互換性（チェーンより厳しい上位集合で見る）、8. 成果物の実在
+            self._require_compatible(records, CUSTOM_CONCAT_COMPAT_FIELDS)
+            self._require_outputs_exist(records)
+
+            return records
 
     def mark_concat(
         self,

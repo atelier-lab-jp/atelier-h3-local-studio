@@ -879,9 +879,15 @@ def _video_path(result) -> str | None:
 
 
 def test_completed_tab_lists_clips_and_concat(p4_app):
-    """③の一覧に成功した個別動画と連結動画が新しい順で並ぶ（失敗記録は出ない）。"""
+    """③の一覧に成功した個別動画と連結動画が新しい順で並ぶ（失敗記録は出ない）。
+
+    P5.2 で `/on_videos_tick` の戻り値は 3→**4**（末尾に指定順連結の候補を追加）。
+    既存3つの順番と意味は変えていない。
+    """
     client, _service, _cfg = p4_app
-    listing, choices, concat_status = client.predict(api_name="/on_videos_tick")
+    listing, choices, concat_status, clip_choices = client.predict(
+        api_name="/on_videos_tick"
+    )
 
     assert "完成した動画" in listing
     assert "v_p4_root" in listing and "v_p4_child" in listing
@@ -974,10 +980,11 @@ def test_preview_is_not_reset_by_timer_ticks(p4_app):
     before = _video_path(client.predict("clip:v_p4_root", api_name="/on_select_video")[0])
     assert before is not None
 
-    # tick を何度回してもプレーヤーは出力に含まれない（3値＝一覧・選択肢・連結状態）
+    # tick を何度回してもプレーヤーは出力に含まれない
+    # （4値＝一覧・選択肢・連結状態・指定順連結の候補。P5.2 で末尾に1つ増えた）
     for _ in range(3):
         tick = client.predict(api_name="/on_videos_tick")
-        assert len(tick) == 3
+        assert len(tick) == 4
         assert isinstance(tick[0], str) and isinstance(tick[2], str)
         assert not any(
             isinstance(v, dict) and ("path" in v or "video" in v) for v in tick
@@ -1519,3 +1526,240 @@ def test_existing_p1_api_signature_is_preserved(p4_app):
         assert name in endpoints, f"{name} が失われています"
         assert len(endpoints[name]["parameters"]) == n_in, name
         assert len(endpoints[name]["returns"]) == n_out, name
+
+
+
+# ==================================== ③指定順連結の操作（P5.2・設計書 §23.5）
+#
+# 並びは `gr.State` にあり、State は HTTP API から駆動できない（サーバ側の
+# セッションに閉じている＝**それ自体がセッション独立の担保**でもある）。
+# そこで並びを変える処理は `app/ui/minimal.py` のモジュール関数として
+# 純粋に切り出してあり、ここではその関数を直接検証する。
+# 「連結を実行して③一覧へ出る」までの通し確認は AppService＋HTTP で行う。
+
+from app.ui.minimal import (  # noqa: E402
+    MAX_CUSTOM_CLIPS,
+    custom_order_add,
+    custom_order_clear,
+    custom_order_move,
+    custom_order_remove,
+)
+
+KNOWN = {"v_p4_root", "v_p4_child", "v_p4_solo"}
+
+
+def test_custom_add_appends_in_order():
+    order, message = custom_order_add([], "v_p4_root", KNOWN)
+    assert order == ["v_p4_root"]
+    assert "1 番目に追加" in message
+
+    order, message = custom_order_add(order, "v_p4_child", KNOWN)
+    assert order == ["v_p4_root", "v_p4_child"]
+    assert "2 番目に追加" in message
+
+
+def test_custom_add_rejects_duplicates():
+    order, _ = custom_order_add([], "v_p4_root", KNOWN)
+    same, message = custom_order_add(order, "v_p4_root", KNOWN)
+    assert same == order
+    assert "すでに連結候補" in message
+
+
+def test_custom_add_rejects_empty_selection():
+    order, message = custom_order_add([], "", KNOWN)
+    assert order == []
+    assert "選んでください" in message
+
+
+def test_custom_add_rejects_ids_outside_the_candidate_list():
+    """連結成果物や存在しないIDは追加できない（UI 側の第一の関門）。"""
+    for bad in ("cm_20260809_213000_0001", "v_no_such_id", "../etc/passwd"):
+        order, message = custom_order_add([], bad, KNOWN)
+        assert order == []
+        assert "一覧にありません" in message
+
+
+def test_custom_add_accepts_up_to_twenty_and_rejects_the_next():
+    ids = [f"v_2026080{i // 10}_1200{i % 10:02d}_x{i:03d}" for i in range(21)]
+    known = set(ids)
+    order: list[str] = []
+    for job_id in ids[:MAX_CUSTOM_CLIPS]:
+        order, message = custom_order_add(order, job_id, known)
+        assert "追加しました" in message
+    assert len(order) == MAX_CUSTOM_CLIPS
+
+    same, message = custom_order_add(order, ids[MAX_CUSTOM_CLIPS], known)
+    assert same == order
+    assert f"{MAX_CUSTOM_CLIPS} 本まで" in message
+
+
+def test_custom_move_up_and_down():
+    order = ["v_p4_root", "v_p4_child"]
+    moved, message = custom_order_move(order, "v_p4_child", -1)
+    assert moved == ["v_p4_child", "v_p4_root"]
+    assert "1 番目に移動" in message
+
+    back, message = custom_order_move(moved, "v_p4_child", 1)
+    assert back == order
+    assert "2 番目に移動" in message
+
+
+def test_custom_move_stops_at_both_ends():
+    order = ["v_p4_root", "v_p4_child"]
+    same, message = custom_order_move(order, "v_p4_root", -1)
+    assert same == order and "すでに1番目" in message
+
+    same, message = custom_order_move(order, "v_p4_child", 1)
+    assert same == order and "すでに最後" in message
+
+
+def test_custom_move_requires_a_target():
+    order = ["v_p4_root", "v_p4_child"]
+    same, message = custom_order_move(order, "", -1)
+    assert same == order and "対象を選ぶ" in message
+
+    same, message = custom_order_move(order, "v_not_selected", -1)
+    assert same == order and "連結候補に入っていません" in message
+
+
+def test_custom_move_keeps_every_element():
+    """入れ替えで要素が増えたり消えたりしない。"""
+    order = ["a", "b", "c", "d"]
+    moved, _ = custom_order_move(order, "d", -1)
+    assert sorted(moved) == sorted(order)
+    assert moved == ["a", "b", "d", "c"]
+
+
+def test_custom_remove():
+    order = ["v_p4_root", "v_p4_child"]
+    left, message = custom_order_remove(order, "v_p4_root")
+    assert left == ["v_p4_child"]
+    assert "連結候補から外しました" in message
+
+    same, message = custom_order_remove(left, "v_p4_root")
+    assert same == left and "連結候補に入っていません" in message
+
+    same, message = custom_order_remove(left, "")
+    assert same == left and "選んでください" in message
+
+
+def test_custom_clear():
+    cleared, message = custom_order_clear(["v_p4_root", "v_p4_child"])
+    assert cleared == []
+    assert "すべて解除" in message
+
+    again, message = custom_order_clear([])
+    assert again == [] and "もともと空" in message
+
+
+def test_custom_order_functions_never_mutate_the_input():
+    """State をその場で書き換えない（別セッションへ影響しないことの土台）。"""
+    original = ["v_p4_root", "v_p4_child"]
+    for call in (
+        lambda: custom_order_add(original, "v_p4_solo", KNOWN),
+        lambda: custom_order_move(original, "v_p4_child", -1),
+        lambda: custom_order_remove(original, "v_p4_root"),
+        lambda: custom_order_clear(original),
+    ):
+        snapshot = list(original)
+        call()
+        assert original == snapshot, "入力の並びが書き換えられています"
+
+
+# ---------------------------------------------------------- 通し確認（HTTP）
+
+
+def _wait_concat(service, timeout: float = 60.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = service.concat_status()
+        if status.state in ("done", "failed"):
+            return status
+        time.sleep(0.05)
+    raise AssertionError(f"連結が終わりませんでした: {service.concat_status()}")
+
+
+def test_custom_concat_needs_two_clips(p4_app):
+    """1本だけでは連結できない（判定は実行スレッドの中で確定する）。"""
+    _client, service, _cfg = p4_app
+    service.start_custom_concat(["v_p4_root"])
+    status = _wait_concat(service)
+    assert status.state == "failed"
+    assert "2本以上" in status.message
+
+
+def test_custom_concat_appears_in_the_completed_list(p4_app):
+    """指定順連結の成果物が③一覧・選択肢・プレビュー・Finder 解決から使える。"""
+    client, service, _cfg = p4_app
+    service.start_custom_concat(["v_p4_child", "v_p4_root"])
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+    assert status.mode == "custom"
+    assert status.sources == ("v_p4_child", "v_p4_root")  # 指定順のまま
+    concat_id = status.concat_id
+
+    listing, choices, _concat, _clips = client.predict(api_name="/on_videos_tick")
+    assert concat_id in listing
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
+    assert f"concat:{concat_id}" in values
+
+    video, meta, _tech = client.predict(f"concat:{concat_id}", api_name="/on_select_video")
+    assert _video_path(video) is not None
+    assert "連結元" in meta and "v_p4_child" in meta
+
+    reveal = client.predict(f"concat:{concat_id}", api_name="/on_reveal_video")
+    assert "見つかりません" not in reveal
+
+
+def test_custom_concat_candidates_exclude_concat_products(p4_app):
+    """候補には**個別動画だけ**が載る（連結成果物は素材にできない）。"""
+    client, service, _cfg = p4_app
+    _listing, _choices, _concat, clip_choices = client.predict(api_name="/on_videos_tick")
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in clip_choices["choices"]]
+    assert "v_p4_root" in values and "v_p4_child" in values
+    assert not any(str(v).startswith("cm_") for v in values)
+    assert all(r.kind == "clip" for r in service.concat_candidates())
+
+
+def test_chain_concat_is_not_regressed_by_custom_concat(p4_app):
+    """既存の「ルートからここまでを連結」がこれまでどおり動く。"""
+    client, service, _cfg = p4_app
+    message = client.predict("clip:v_p4_child", api_name="/on_start_concat")[0]
+    assert "❌" not in message, message
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+    assert status.mode == "chain"
+    assert status.output_path.name.startswith("c_")
+
+
+def test_custom_and_chain_concat_share_one_lane(p4_app, monkeypatch):
+    """実行中はもう一方も断られる（サーバ側の相互排他）。"""
+    from app.core.concat_service import ConcatError
+
+    _client, service, _cfg = p4_app
+
+    def busy(*_a, **_kw):
+        raise ConcatError("連結を実行中です。完了までお待ちください（実行中: 指定順連結 / 2本）")
+
+    monkeypatch.setattr(service._concat, "start_concat", busy)
+    assert "連結を実行中です" in service.start_concat("v_p4_child")
+    monkeypatch.undo()
+
+
+def test_manual_concat_row_hides_seed_and_steps(p4_app):
+    """指定順連結の行に seed・ステップを出さない（複数動画の結果なので値が無い）。"""
+    from app.ui.minimal import _seed_cell
+
+    _client, service, _cfg = p4_app
+    service.start_custom_concat(["v_p4_root", "v_p4_child"])
+    status = _wait_concat(service)
+    assert status.state == "done", status.message
+
+    row = service.find_row(status.concat_id, "concat")
+    assert row is not None and row.concat_kind == "manual"
+    assert row.seed_used is None and row.seed_requested is None and row.steps is None
+    assert _seed_cell(row) == "—", "seed 欄に『ランダム』と出てはいけない"
+
+    # 個別動画・チェーン連結の表示は従来どおり
+    clip = service.find_row("v_p4_root", "clip")
+    assert _seed_cell(clip) != "—"

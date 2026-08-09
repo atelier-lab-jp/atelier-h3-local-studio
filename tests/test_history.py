@@ -1211,3 +1211,247 @@ def test_readonly_data_root_returns_warning_not_exception(tmp_path: Path):
         assert s.list_records() == []
     finally:
         root.chmod(0o700)
+
+
+# ============================================== 任意順序連結の入力解決（P5.2）
+#
+# `resolve_custom_concat()` は親子関係を一切見ない。代わりに「ユーザーが選んだ
+# 任意の並び」が連結してよいものかを確かめ、**並びをそのまま**返す。
+
+CUSTOM_IDS = [
+    "v_20260807_120000_c001",
+    "v_20260807_120001_c002",
+    "v_20260807_120002_c003",
+]
+
+
+def _success_singles(
+    store: HistoryStore,
+    data_root: Path,
+    ids: list[str],
+    *,
+    create_files: bool = True,
+    overrides: dict[str, dict] | None = None,
+) -> None:
+    """親子関係のない独立した SUCCESS 動画を作る（任意連結の素材）。"""
+    for job_id in ids:
+        rec = make_record(data_root, job_id, job_type="single", parent_id=None)
+        if overrides and job_id in overrides:
+            rec = dataclasses.replace(rec, **overrides[job_id])
+        store.add(rec)
+        store.mark_running(job_id, T0)
+        out = data_root / "outputs" / f"{job_id}.mp4"
+        last = data_root / "outputs" / f"{job_id}_last.png"
+        if create_files:
+            out.write_bytes(b"fake mp4")
+            last.write_bytes(b"fake png")
+        store.mark_success(
+            job_id,
+            output_path=out,
+            last_frame_path=last,
+            seed_used=42,
+            elapsed_sec=1.0,
+            finished_at=T0,
+        )
+
+
+def test_resolve_custom_concat_two_clips(store: HistoryStore, data_root: Path):
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    got = store.resolve_custom_concat(CUSTOM_IDS[:2])
+    assert [r.id for r in got] == CUSTOM_IDS[:2]
+
+
+def test_resolve_custom_concat_keeps_the_requested_order(
+    store: HistoryStore, data_root: Path
+):
+    """作成日時やID順へ**並べ替えない**（指定順が成果物の順になる）。"""
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS)
+    requested = [CUSTOM_IDS[2], CUSTOM_IDS[0], CUSTOM_IDS[1]]
+    assert [r.id for r in store.resolve_custom_concat(requested)] == requested
+
+    reverse = list(reversed(CUSTOM_IDS))
+    assert [r.id for r in store.resolve_custom_concat(reverse)] == reverse
+
+
+def test_resolve_custom_concat_twenty_clips(store: HistoryStore, data_root: Path):
+    store.load()
+    ids = [f"v_20260807_1200{i:02d}_d{i:03d}" for i in range(20)]
+    _success_singles(store, data_root, ids)
+    shuffled = ids[10:] + ids[:10]
+    assert [r.id for r in store.resolve_custom_concat(shuffled)] == shuffled
+
+
+def test_resolve_custom_concat_rejects_a_single_clip(store: HistoryStore, data_root: Path):
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:1])
+    with pytest.raises(HistoryError, match="2本以上"):
+        store.resolve_custom_concat(CUSTOM_IDS[:1])
+
+
+def test_resolve_custom_concat_rejects_twenty_one_clips(
+    store: HistoryStore, data_root: Path
+):
+    store.load()
+    ids = [f"v_20260807_1200{i:02d}_e{i:03d}" for i in range(21)]
+    _success_singles(store, data_root, ids)
+    with pytest.raises(HistoryError, match="20本まで"):
+        store.resolve_custom_concat(ids)
+
+
+def test_resolve_custom_concat_rejects_duplicates(store: HistoryStore, data_root: Path):
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS)
+    with pytest.raises(HistoryError, match="同じ動画が複数回"):
+        store.resolve_custom_concat([CUSTOM_IDS[0], CUSTOM_IDS[1], CUSTOM_IDS[0]])
+
+
+def test_resolve_custom_concat_rejects_unknown_ids(store: HistoryStore, data_root: Path):
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    with pytest.raises(HistoryError, match="履歴に無い"):
+        store.resolve_custom_concat([CUSTOM_IDS[0], "v_20260807_999999_zzzz"])
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "",
+        "   ",
+        "../../etc/passwd",
+        "outputs/v_x.mp4",
+        "..",
+        "'; DROP--",
+        "v_\n20260807",
+        "x" * 65,
+    ],
+)
+def test_resolve_custom_concat_rejects_unsafe_ids(
+    store: HistoryStore, data_root: Path, bad_id
+):
+    """パス区切り・`..`・制御文字などの危険なIDは履歴を引く前に弾く。"""
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    with pytest.raises(HistoryError, match="動画IDの形式"):
+        store.resolve_custom_concat([CUSTOM_IDS[0], bad_id])
+
+
+def test_resolve_custom_concat_rejects_ids_absent_from_history(
+    store: HistoryStore, data_root: Path
+):
+    """形式上は安全でも、履歴に無いIDは通さない（本人確認は実在で行う）。"""
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    with pytest.raises(HistoryError, match="履歴に無い"):
+        store.resolve_custom_concat([CUSTOM_IDS[0], "v_bad"])
+
+
+def test_resolve_custom_concat_rejects_non_success(store: HistoryStore, data_root: Path):
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    failed = "v_20260807_120009_f001"
+    store.add(make_record(data_root, failed))
+    store.mark_running(failed, T0)
+    store.mark_failed(
+        failed, error="擬似失敗", category="input", elapsed_sec=1.0, finished_at=T0
+    )
+
+    with pytest.raises(HistoryError, match="成功していない動画"):
+        store.resolve_custom_concat([CUSTOM_IDS[0], failed])
+
+
+def test_resolve_custom_concat_rejects_a_concat_product_as_material(
+    store: HistoryStore, data_root: Path
+):
+    """連結成果物（`cm_...`）は素材にできない（理由が分かる文言で断る）。"""
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    with pytest.raises(HistoryError, match="連結した動画は素材にできません"):
+        store.resolve_custom_concat([CUSTOM_IDS[0], "cm_20260809_213000_0001"])
+
+
+def test_resolve_custom_concat_rejects_missing_files(store: HistoryStore, data_root: Path):
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    (data_root / "outputs" / f"{CUSTOM_IDS[1]}.mp4").unlink()
+    with pytest.raises(HistoryError, match="動画ファイルが見つかりません"):
+        store.resolve_custom_concat(CUSTOM_IDS[:2])
+
+
+def test_resolve_custom_concat_rejects_a_directory_instead_of_a_file(
+    store: HistoryStore, data_root: Path
+):
+    """手編集で出力パスがディレクトリを指していても通さない。"""
+    store.load()
+    _success_singles(store, data_root, CUSTOM_IDS[:2])
+    target = data_root / "outputs" / f"{CUSTOM_IDS[1]}.mp4"
+    target.unlink()
+    target.mkdir()
+    with pytest.raises(HistoryError, match="動画ファイルが見つかりません"):
+        store.resolve_custom_concat(CUSTOM_IDS[:2])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("backend_id", "other_backend", "生成バックエンド"),
+        ("model_id", "別モデル", "モデル"),
+        ("model_revision", "別の版", "モデルの版"),
+        ("execution_engine", "real", "生成方法"),
+        ("width", 640, "幅"),
+        ("height", 480, "高さ"),
+        ("fps", 30, "fps"),
+    ],
+)
+def test_resolve_custom_concat_rejects_incompatible(
+    store: HistoryStore, data_root: Path, field, value, message
+):
+    """互換性はチェーン連結より広い項目で見る（版・実行方式を追加）。"""
+    store.load()
+    _success_singles(
+        store,
+        data_root,
+        CUSTOM_IDS[:2],
+        overrides={CUSTOM_IDS[1]: {field: value}},
+    )
+    with pytest.raises(HistoryError, match=message):
+        store.resolve_custom_concat(CUSTOM_IDS[:2])
+
+
+def test_resolve_custom_concat_allows_different_seed_steps_and_prompt(
+    store: HistoryStore, data_root: Path
+):
+    """seed・ステップ・長さ・プロンプトが違っても連結できる（仕様）。"""
+    store.load()
+    _success_singles(
+        store,
+        data_root,
+        CUSTOM_IDS,
+        overrides={
+            CUSTOM_IDS[1]: {"steps": 8, "num_frames": 124, "duration_label": "5.17秒"},
+            CUSTOM_IDS[2]: {"seed_used": 999, "prompt": "まったく別のプロンプト"},
+        },
+    )
+    assert len(store.resolve_custom_concat(CUSTOM_IDS)) == 3
+
+
+def test_resolve_custom_concat_accepts_continuation_clips(
+    store: HistoryStore, data_root: Path
+):
+    """`type="continuation"` の動画も個別動画として素材にできる。"""
+    store.load()
+    _success_chain(store, data_root, CHAIN_IDS[:2])
+    got = store.resolve_custom_concat([CHAIN_IDS[1], CHAIN_IDS[0]])
+    assert [r.id for r in got] == [CHAIN_IDS[1], CHAIN_IDS[0]]
+
+
+def test_resolve_custom_concat_does_not_change_chain_resolution(
+    store: HistoryStore, data_root: Path
+):
+    """既存のチェーン連結の解決は非回帰（同じ素材で両方が従来どおり動く）。"""
+    store.load()
+    _success_chain(store, data_root, CHAIN_IDS[:3])
+    assert [r.id for r in store.resolve_concat_chain(CHAIN_IDS[2])] == CHAIN_IDS[:3]
+    reverse = list(reversed(CHAIN_IDS[:3]))
+    assert [r.id for r in store.resolve_custom_concat(reverse)] == reverse
