@@ -584,6 +584,58 @@ def test_broken_keyframe_is_rejected_by_the_worker(make_engine, paths):
     assert wait_terminal(engine).type is EventType.DONE
 
 
+# ---------------------------------------------------------------- 開始画像（P8）
+
+
+def start_image_spec(paths, image: Path, job_id: str = "v_start_0001", **overrides):
+    """開始画像からの生成の JobSpec（親を持たず、画像だけを持つ形）。"""
+    params = {"job_type": "start_image", "keyframe_path": image}
+    params.update(overrides)
+    return make_spec(paths, job_id=job_id, **params)
+
+
+def test_start_image_is_sent_as_keyframe_path_on_the_wire(make_engine, paths):
+    """P8: 開始画像は継続生成と同じ keyframe_path として絶対パスで載る。
+
+    エンジンとワーカーから見れば「第1フレームの画像」以上の意味はなく、
+    開始画像のための新しいワイヤ項目は増やしていない。
+    """
+    engine = make_engine("normal")
+    image = write_png(paths["data_root"] / "start_images" / "si_0123456789ab.png")
+    spec = start_image_spec(paths, image)
+
+    terminal, _ = run_to_terminal(engine, spec)
+
+    assert terminal.type is EventType.DONE, terminal.message
+    dump = received_keyframe(paths)
+    assert dump["job_id"] == spec.job_id
+    assert dump["keyframe_path"] == str(image)
+    assert Path(dump["keyframe_path"]).is_absolute()
+    # 成果物の形は単発生成と同じ（昇格済み・partial なし）
+    assert spec.output_path.is_file() and spec.last_frame_path.is_file()
+    assert list(paths["outputs"].glob("*.partial")) == []
+    # 開始画像は読むだけで書き換えない
+    assert image.is_file()
+
+
+def test_start_image_outside_data_root_is_rejected(make_engine, paths):
+    """P8: data_root 外の開始画像は submit で同期拒否（§15）。"""
+    engine = make_engine("normal")
+    outside = write_png(paths["outside"] / "stolen_start.png")
+
+    with pytest.raises(ValidationError, match="データ領域の外"):
+        engine.submit(start_image_spec(paths, outside))
+
+    assert not paths["keyframe_dump"].exists()  # generate は送られていない
+
+
+def test_start_image_job_without_an_image_is_rejected(make_engine, paths):
+    """P8: 画像の無い start_image は中途半端な指定なので下位層でも弾く。"""
+    engine = make_engine("normal")
+    with pytest.raises(ValidationError, match="開始画像が必要"):
+        engine.submit(make_spec(paths, job_type="start_image"))
+
+
 # ---------------------------------------------------------------- handshake 不一致
 
 

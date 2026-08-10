@@ -155,6 +155,16 @@ class AppConfig:
         return self.data_root / "trash"
 
     @property
+    def start_images_dir(self) -> Path:
+        """開始画像のジョブ用スナップショット（P8）。**HTTP 配信対象には入れない**。"""
+        return self.data_root / "start_images"
+
+    @property
+    def start_images_staging_dir(self) -> Path:
+        """開始画像の一時領域（P8）。プレビュー段階。起動時に掃除する。"""
+        return self.data_root / "start_images" / "staging"
+
+    @property
     def assets_mock_dir(self) -> Path:
         return self.project_root / "app" / "assets" / "mock"
 

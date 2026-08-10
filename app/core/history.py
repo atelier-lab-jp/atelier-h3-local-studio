@@ -382,7 +382,11 @@ class HistoryRecord:
         """
         return cls(
             id=spec.job_id,
-            type=spec.job_type,
+            # 開始画像からの生成は履歴上「個別動画」として扱う（P8・決定D26）。
+            # _JOB_TYPES と history.json のスキーマを変えないので、過去のコミットへ
+            # 戻しても履歴が壊れない。開始画像つきかどうかは
+            # `parent_id is None and keyframe_path is not None` で判別できる。
+            type=("single" if spec.job_type == "start_image" else spec.job_type),
             status=JobStatus.QUEUED,
             created_at=created_at,
             started_at=None,

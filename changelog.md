@@ -5,6 +5,108 @@
 
 ---
 
+## [Unreleased] 2026-08-10 — P8: 開始画像から動画を作る
+
+手元の写真やイラストを **動画の第1フレーム**に固定して生成できるようにした。
+**生成側の固定仕様（576×320・24fps・56/124フレーム・4/8ステップ・直列1本）は無変更**で、
+**新規モデルのダウンロードも新規 Python パッケージの追加も無い**。
+設計は `docs/v1-design.md` §28（決定D23〜D26）。
+
+使うのは **FL2VA（First-Last frame to Video-Audio）の第1フレーム条件**で、
+継続生成（P4）が親の最終フレームを渡している経路と同じもの。
+ワーカーへは `keyframes=[画像]` / `keyframe_indices=[0]` を渡し、
+**`references` は渡さない**＝ **Ref2VA ではない**。
+
+- **PoC 実測（M4・56フレーム・4ステップ）: 7分57秒**（通常生成 403秒の **1.18倍**）
+- **Ref2VA は 2,925秒（48.8分）**かかったため V1 では不採用（§2.2）
+- 既存の FL2VA DiT・FL2VA processor・text encoder・Video/Audio VAE・
+  Turbo LoRA を**そのまま再利用**。DiffSynth-Studio は無変更
+
+### 不採用にした案（実装しない）
+インタラクティブなクロップ・回転エディタ／モード選択ラジオ／素材ライブラリ／
+複数画像／最終フレーム指定／任意フレーム位置への画像挿入／参照動画・参照音楽・Ref2VA／
+顔検出などの自動クロップ位置決め／開始画像専用の台帳／履歴スキーマの変更／
+開始画像の一覧・再利用UI。
+
+### Added
+- **`app/core/start_image.py`** — 検証・正規化・staging保存・確定・掃除を行う純粋層
+  （UI にもエンジンにも依存せず、`gradio` を import しない）。
+  例外 `StartImageError` は**利用者向け日本語だけ**を持ち、内部パス・例外文・
+  スタックを含めない
+- **①新規生成タブの「開始画像（任意）」**（`app/ui/minimal.py`）—
+  プロンプト補助ボタンの直下・長さ選択の直前。未選択時は説明だけ、選択後は
+  **変換後の 576×320 をプレビュー**し、切り取り量・透過の告知を出す。
+  ［開始画像を外す］は**引数を取らず固定値だけ返す**（`on_clear_prompt` と同型）
+- **`/on_submit_v3`（7引数）** — 開始画像IDを受け取る投入口。
+  `/on_submit`（5引数）・`/on_submit_v2`（6引数）は API 専用の非表示ボタンで温存
+- `AppService.prepare_start_image()` と `submit_generation(_ex)(start_image_id=...)`、
+  `config` の `start_images_dir` / `start_images_staging_dir`、
+  preflight のディレクトリ作成・孤児 `.partial` 列挙・起動時の staging 掃除
+- `app/main.py` に `max_file_size="40mb"`（`allowed_paths` は**無変更**）。
+  Gradio のキャッシュ掃除 `delete_cache=(3600, 3600)` は Blocks 側へ指定
+
+### 受け入れる画像／断る画像
+- **PNG・JPEG・非アニメーション WebP** のみ。32MB／5000万画素／辺12000px 以下、
+  **最小 576×320**（拡大させない）、縦横比 0.5〜3.0
+- **HEIC/HEIF・AVIF・GIF・SVG・TIFF・アニメーション・16bit(HDR)・壊れた画像・
+  巨大画像・symlink** は日本語で拒否。HEIC は
+  「［設定］→［カメラ］→［フォーマット］を『互換性優先』に」まで案内する
+- **クロップ先は 1.8:1（9:5）＝出力そのものの形**。576×320 は 16:9（1.7778）ではなく、
+  16:9 で切ると横に **1.25% 引き伸びる**ため（決定D24）。中央クロップのみで、
+  引き伸ばしは一切しない
+- **576×320 ちょうどの RGB は画素を1ビットも変えずに通す**（メタデータだけ除去）
+- **透過は黒で塗りつぶし、その旨を必ず告知する**
+
+### 保存先と配信境界
+- `data/start_images/`（一時領域は `data/start_images/staging/`）。
+  **`allowed_paths` にも `_servable()` にも入れない**（§26.9 の規律のまま、
+  どちらにも足さないのが正解）
+- UI が持つのは**サーバ採番の ID（`si_` ＋ 正規化PNG の SHA-256 先頭12桁）だけ**。
+  パスはブラウザへ出さないし受け取らない。**プレビューは PIL 値で返す**ので
+  配信経路を1本も増やしていない
+- 投入時に**内容ハッシュを再照合**してから正式パスへ確定するので、
+  プレビューした画像とジョブへ渡る画像の**バイト列が一致する**。
+  投入後に別の画像を選び直しても登録済みジョブの画像は変わらない
+
+### Changed（既存の契約は壊していない）
+- `JobSpec.job_type` に `"start_image"` を追加。
+  **`single` が `keyframe_path` を拒否する条件は一切緩めていない**ので、
+  既存の継続生成・エンジン試験が無修正で通る
+- 履歴は **`type="single"`（個別動画）**として記録（決定D26）。
+  `_JOB_TYPES`・`SCHEMA_VERSION`・`resolve_chain()` は**無変更**。
+  判別は `parent_id is None and keyframe_path is not None`
+- プロンプトは投入時にサーバ側で
+  `Continue directly from the supplied first frame.` を**冪等付与**。
+  二重投入の冪等化キーにも開始画像IDを含める
+- `tests/test_mobile_ui.py` の投入経路の名前を1行だけ更新（`on_submit_v2` → `on_submit_v3`）
+
+### 変更していないもの
+生成の解像度・fps・フレーム数・ステップ数・直列1本／ワーカープロトコル／
+`history.json`・`concat_manifest.json` のスキーマ／`allowed_paths` と `_servable()`／
+既存7つの固定 API（`/on_submit` `/on_tick` `/on_estimate_change` `/on_insert_hint`
+`/on_queue_tick` `/on_cancel_queued` `/on_restart_worker`）と `/on_submit_v2`／
+6つの Timer（tick）の出力の数と順序／`gr.State` の数（3個）／`h3-panel` の数（3個）／
+継続生成・チェーン連結・任意順連結・1080p高品質化・ゴミ箱・Finder表示。
+**開始画像から作った動画は、これらすべてで従来どおりの個別動画として扱える。**
+
+### Added（試験）
+- `tests/test_start_image.py` — 正規化層（形式・寸法・アニメ・16bit・巨大画像・
+  symlink・境界・決定性・メタデータ除去・staging と確定・掃除）
+- `tests/test_start_image_job.py` — ジョブ契約と履歴（`start_image` 種別・
+  排他・冪等化・`type="single"` での記録・領域外パスの拒否）
+- `tests/test_start_image_ui.py`（36件）— 画面の構造・初期表示・文言・配線を
+  実際に `/config` と HTTP で確認する。**Timer が開始画像に触れないこと**、
+  **`gr.State`／`h3-panel` の数が変わっていないこと**、
+  **ブラウザへ返るのが ID と画像だけであること**、
+  **`data/start_images` が HTTP で配信されないこと**を機械的に固定する
+
+### Verified
+- 全試験 **1480 passed / 1 skipped / 1 xpassed**（P7 時点は 1350。P8 で 130件追加）
+- 既存の UI 試験（`test_mobile_ui` / `test_ui_flow` / `test_history_tab_readonly` /
+  `test_upscale_ui` / `test_lan_security`）は**1件も落ちていない**
+
+---
+
 ## [Unreleased] 2026-08-10 — P7: ④「履歴」タブを閲覧専用へ
 
 ③「完成・編集」と④「履歴」に同じ操作が2か所ずつ並んでいた状態を解消した。

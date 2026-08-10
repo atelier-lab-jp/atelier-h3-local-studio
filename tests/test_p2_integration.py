@@ -374,6 +374,57 @@ def test_missing_keyframe_is_rejected_before_the_worker(service, tmp_path):
     assert service.engine.state() is EngineState.READY
 
 
+# ------------------------------------------------------------------ 開始画像（P8）
+
+
+def test_start_image_reaches_the_pipe_as_a_first_frame(service, tmp_path):
+    """P8 の縦串: 利用者が選んだ画像が実ワーカーを通って pipe まで届く。
+
+    実 `start_image`（正規化・確定）× 実 AppService × 実 h3_worker × 実 RealEngine で、
+    継続生成とまったく同じ `keyframes=[画像]` / `keyframe_indices=[0]` の形になり、
+    **参照画像（Ref2VA）としては渡していない**ことを確認する。
+    """
+    from PIL import Image
+
+    from app.core.start_image import normalize_start_image
+
+    source = tmp_path / "upload.png"
+    with Image.new("RGB", (1152, 640), (10, 90, 200)) as img:  # 1.8:1（出力と同じ形）
+        img.save(source, format="PNG")
+    prepared = normalize_start_image(source, data_root=service.cfg.data_root)
+
+    view = service.submit_generation(
+        prompt="開始画像から動かす <d>[Japanese] はじまり</d>",
+        num_frames=56,
+        steps=4,
+        seed_requested=999,
+        start_image_id=prepared.start_image_id,
+    )
+    record = _wait_terminal(service, view.job_id, timeout=60.0)
+    assert record.status is JobStatus.SUCCESS, record.error
+
+    calls = _pipe_calls(tmp_path)
+    assert len(calls) == 1, calls
+    assert calls[0]["has_keyframes"] is True
+    assert calls[0]["keyframe_indices"] == [0]
+    assert len(calls[0]["keyframes"]) == 1
+    assert calls[0]["keyframes"][0]["mode"] == "RGB"
+    assert calls[0]["keyframes"][0]["size"] == [576, 320]
+    assert calls[0]["seed"] == 999
+    # Ref2VA は実装しない（参照素材としては1つも渡さない）
+    assert "references" not in calls[0]["keys"]
+    assert "reference_images" not in calls[0]["keys"]
+
+    # 履歴は「個別動画」（親を持たない・開始画像を持つ）
+    assert record.type == "single"
+    assert record.parent_id is None
+    assert record.keyframe_path == f"start_images/{prepared.start_image_id}.png"
+    # 開始画像そのものは読むだけ（1バイトも変えない）
+    committed = service.cfg.data_root / record.keyframe_path
+    assert committed.is_file() and committed.read_bytes() == prepared.png_bytes
+    assert service.history.to_absolute(record.output_path).is_file()
+
+
 # ------------------------------------------------------------------ 異常系
 
 

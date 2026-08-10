@@ -1,11 +1,56 @@
 # ai_summary.md — 現在状態の正本
 
 > この文書は「最新状態の正本」であり、過去ログは積まず常に現在地を表すよう上書き更新する。
-> 経緯は `changelog.md`、恒久ルールは `CLAUDE.md`、設計は `docs/v1-design.md`（v1.10）を参照。
+> 経緯は `changelog.md`、恒久ルールは `CLAUDE.md`、設計は `docs/v1-design.md`（v1.11）を参照。
 
 - **最終更新日**: 2026-08-10
 - **プロジェクトの目的**: Mac mini（M4・24GB・MPS）上で動く完全ローカルの音声付き動画生成アプリ。初心者がブラウザ（Gradio・日本語UI・localhost限定）から MiniMax-H3 動画を生成できるようにする。
-- **現在フェーズ**: **P6・P7 完了（いずれも未コミット）。V1.0.0 Release Candidate（実iPhoneでの最終確認待ち）**
+- **現在フェーズ**: **P6・P7・P8 完了（いずれも未コミット）。V1.0.0 Release Candidate（実iPhoneでの最終確認待ち＋P8 の実機生成確認）**
+
+## P8 で入れた開始画像（2026-08-10）
+
+手元の写真やイラストを **動画の第1フレーム**に固定して生成する。
+**生成側の固定仕様（576×320・24fps・56/124フレーム・4/8ステップ・直列1本）は無変更**で、
+**新規モデルも新規 Python パッケージも足していない**。設計は `docs/v1-design.md` §28（決定D23〜D26）。
+
+- **Ref2VA ではない** — 使うのは **FL2VA の第1フレーム条件**（`keyframes=[画像]`・
+  `keyframe_indices=[0]`。`references` は渡さない）。継続生成（P4）が親の最終フレームを
+  渡している経路と同じで、渡す画像が利用者の選んだ画像に変わるだけ
+- **PoC 実測 7分57秒**（同条件の通常生成 403秒の **1.18倍**）。
+  **Ref2VA は 2,925秒（48.8分）で V1 不採用**
+- **既存 FL2VA 一式を再利用** — FL2VA DiT・FL2VA processor・text encoder・
+  Video/Audio VAE・Turbo LoRA。**モデルの追加ダウンロードなし**・DiffSynth-Studio 無変更
+- **不採用**（作らない）: クロップ／回転エディタ・モード選択ラジオ・素材ライブラリ・
+  複数画像・最終フレーム指定・任意フレーム位置への挿入・参照動画／音楽・Ref2VA・
+  自動クロップ位置決め・開始画像専用の台帳・履歴スキーマ変更・開始画像の再利用UI
+- **対応形式は PNG・JPEG・非アニメーション WebP**。HEIC/HEIF・AVIF・GIF・SVG・TIFF・
+  アニメーション・16bit(HDR)・壊れた画像・巨大画像・symlink は**日本語で拒否**。
+  上限 32MB／5000万画素／辺12000px、最小 576×320（拡大しない）、縦横比 0.5〜3.0
+- **クロップ先は 1.8:1（9:5）＝出力そのものの形**（決定D24）。576×320 は 16:9（1.7778）
+  ではなく、16:9 で切ると横に **1.25% 引き伸びる**ため。**中央クロップ＋変換後プレビュー**で、
+  引き伸ばしは一切しない。**576×320 ちょうどの RGB は画素を変えずに通す**（メタデータのみ除去）。
+  透過は**黒で塗りつぶし、その旨を必ず告知**する
+- **保存先 `data/start_images/`**（一時領域は `staging/`）。**`allowed_paths` にも
+  `_servable()` にも入れない**。UI が持つのは**サーバ採番の ID
+  （`si_` ＋ 正規化PNG の SHA-256 先頭12桁）だけ**で、パスはブラウザへ出さない。
+  **プレビューは PIL 値で返す**ので配信経路を1本も増やしていない
+- **投入時に内容ハッシュを再照合**してから正式パスへ確定するので、プレビューした画像と
+  ジョブへ渡る画像の**バイト列が一致**する。投入後に選び直しても登録済みジョブは変わらない
+- **履歴は `parent_id=None` / `type="single"`（個別動画）**（決定D26）。
+  `_JOB_TYPES`・`SCHEMA_VERSION`・`resolve_chain()` は**無変更**。判別は
+  `parent_id is None and keyframe_path is not None`。**`single` が `keyframe_path` を
+  拒否する条件は一切緩めていない**（`start_image` という別種別を追加した）ので、
+  既存の継続生成・エンジン試験が**無修正で通る**
+- 生成後の「続きを作る」「ルート連結」「任意順連結」「1080p高品質化」「ゴミ箱」
+  「Finder表示」は**すべて従来どおり**使える
+- プロンプトは投入時にサーバ側で `Continue directly from the supplied first frame.` を
+  **冪等付与**（冪等化キーにも開始画像IDを含める）
+- UI は①新規生成タブ。**`gr.State` は増やさず**（隠しテキストボックス）、
+  **`h3-panel` も増やさず**、**継続モードとは排他**、
+  **Timer は開始画像の部品に一切触れない**。投入は新しい **`/on_submit_v3`（7引数）**で、
+  `/on_submit`・`/on_submit_v2` と既存7つの固定 API の形は**不変**
+- 新規モジュール: `app/core/start_image.py`（検証・正規化・staging・確定・掃除。
+  `gradio` を import しない純粋層）
 
 ## P7 で決めたタブの役割分担（2026-08-10）
 
@@ -130,7 +175,7 @@
 
 ## 現在の完成状況
 
-設計書 `docs/v1-design.md` は **v1.3**。P0（基盤）→ P0.5（バックエンド境界）→ P1（履歴・キュー・Engine契約・MockEngine・新規生成タブ）→ **P2（実機エンジン）** まで完了。
+設計書 `docs/v1-design.md` は **v1.11**。P0（基盤）→ P0.5（バックエンド境界）→ P1（履歴・キュー・Engine契約・MockEngine・新規生成タブ）→ **P2（実機エンジン）** まで完了。
 **実モデル（MiniMax-H3-NF4 + Turbo LoRA）でブラウザから動画生成できる状態**。config の既定は `engine.mode = "real"`。
 
 ### P5 で完成した機能
@@ -241,8 +286,11 @@
 
 ## テスト結果（最新）
 
-- **1350 passed + 1 skipped + 1 xpassed**（P4 時点は 625+1。P5 で 367 件、P5.1 で 15 件、
-  P5.2 で 137 件、P5.3-A で 25 件、P5.3-B で 53 件、P6 で 87 件、P7 で 37 件追加）
+- **1480 passed + 1 skipped + 1 xpassed**（P4 時点は 625+1。P5 で 367 件、P5.1 で 15 件、
+  P5.2 で 137 件、P5.3-A で 25 件、P5.3-B で 53 件、P6 で 87 件、P7 で 37 件、
+  **P8 で 130 件**追加）
+  - P8 の3ファイル（`test_start_image.py` / `test_start_image_job.py` /
+    `test_start_image_ui.py`）は実モデルを使わず数秒で回る
   - P6 の 4 ファイルは**実モデルも MPS も使わず約4秒**で回る
     （ワーカーは `tests/fixtures/fake_upscale_worker.py` に差し替え）
   - キュー 70／RealEngine 50／MockEngine 41／ワーカー 163／P2統合 13／UI経路 17／履歴 38／P1結合 10／基盤系ほか
@@ -289,6 +337,7 @@ app/core/contracts.py    ★全層が共有する契約（型・遷移表・検�
 app/core/app_service.py  統合層（UI が触る唯一の窓口）
 app/core/history.py      履歴 v1.2（原子的保存・復旧・チェーン解決）
 app/core/job_queue.py    単一ジョブキュー（直列ディスパッチャ）
+app/core/start_image.py  開始画像の検証・正規化・staging・確定（P8。gradio 非依存）
 app/core/                config・applog・naming・fileops・ffmpeg_ops・mock_assets・preflight
 app/engine/base.py       Engine 共通契約（Protocol）
 app/engine/mock_engine.py  MockEngine（実機と同形のイベント）
@@ -299,8 +348,9 @@ app/postprocess/upscale_worker.py  高品質化ワーカー（DiffSynth venv・a
 app/ui/minimal.py        UI（新規生成タブ＋②〜④の骨格）
 scripts/real_stage_test.py  実機試験（stage0/1/2。pytest には含めない）
 config/config.toml       [engine] mode/backend ＋ [backends.minimax_h3]
-data/                    出力・履歴・ログ・upscaled・trash（唯一の書き込み先・gitignore）
-tests/                   388テスト（実モデルは使わない）
+data/                    出力・履歴・ログ・upscaled・trash・start_images
+                         （唯一の書き込み先・gitignore。**start_images と trash は配信対象外**）
+tests/                   実モデルを使わないテスト一式
 ```
 
 ## 変更禁止領域
@@ -316,14 +366,17 @@ tests/                   388テスト（実モデルは使わない）
 - **S9（Wi-Fi 断での完走）は未実施＝ユーザーによる手動確認項目**。P2 では代替として (1) worker.log の `[√] Skip download and load only pre-downloaded model files` (2) モデルファイルの mtime/サイズ変化ゼロ、で追加ダウンロードが無いことを確認した
 - 再起動中にアプリを終了すると体感の終了時間が10〜15秒になりうる（無応答ワーカーの terminate 待ちが積み上がるため。孤児ワーカーは残らない）
 
-## V1 完成後の状態（P5 完了時点）
+## V1 完成後の状態（P8 完了時点）
 
-**コード上は V1.0.0 Release Candidate。** 残るのは**実 iPhone での確認**だけ（QR読取・PIN入力・動画再生・生成投入）。
+**コード上は V1.0.0 Release Candidate。** 残るのは**実機での確認**だけ
+（実 iPhone での QR読取・PIN入力・動画再生・生成投入と、**P8 の開始画像つき実機生成**）。
 それが済めば V1 完成。**Git 管理はユーザーが全確認後に開始する方針のため、commit・tag・push・remote 設定は一切行っていない**（リポジトリにコミットは1件もない）。
 
 ### V2 以降の候補（V1 には入れない）
 
 - 10秒/15秒の一発生成（576×320・243フレームは白黒3×3分割になる既知の破綻）
+- **Ref2VA（参照動画・参照音楽）** — PoC 実測 2,925秒（48.8分）。開始画像1枚だけを P8 で採用した
+- **開始画像の複数枚指定・最終フレーム指定・任意フレーム位置への画像挿入**
 - 任意解像度・並列生成・モデル選択UI・プラグイン機構
 - 外部公開・クラウド同期・ユーザー認証基盤・外部API
 - HTTPS 対応（LANモードは HTTP のみ。敵対的ネットワーク向けではない）
@@ -346,7 +399,9 @@ tests/                   388テスト（実モデルは使わない）
 
 1. `CLAUDE.md` の絶対制約（DiffSynth 読み取り専用・V1固定仕様・フェーズ境界）
 2. 本書の「V1 完成後の状態」と「残っている警告・未解決事項」
-3. `.venv/bin/python -m pytest tests/ -q` が **1223 passed + 1 skipped + 1 xpassed** であること
+3. `.venv/bin/python -m pytest tests/ -q` が **1480 passed + 1 skipped + 1 xpassed** であること
 4. `./scripts/start.sh --check --mode real --deep-check` が合格すること（実機資産が揃っているか）
 5. 設計書 §22.2（バックエンド契約）・付録A（ワーカープロトコルと A.1 の2層構造）・§10.7（原子的保存）・§13.3（fatal 分類）— P2 実装の直接仕様
 6. `app/core/contracts.py` — 全層の契約。ここを変えると全層に波及するので慎重に
+7. 設計書 §28（開始画像）— `data/start_images` を**配信対象に入れない**こと、
+   履歴は `type="single"` のままであることが P8 の要（決定D23〜D26）

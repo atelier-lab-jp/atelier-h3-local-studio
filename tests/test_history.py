@@ -1455,3 +1455,76 @@ def test_resolve_custom_concat_does_not_change_chain_resolution(
     assert [r.id for r in store.resolve_concat_chain(CHAIN_IDS[2])] == CHAIN_IDS[:3]
     reverse = list(reversed(CHAIN_IDS[:3]))
     assert [r.id for r in store.resolve_custom_concat(reverse)] == reverse
+
+
+# ---------------------------------------------------------------- 開始画像（P8）
+
+
+def _start_image_spec(data_root: Path, job_id: str = "v_20260810_120000_si00"):
+    """開始画像からの生成の JobSpec（親を持たず、画像だけを持つ形）。"""
+    image = data_root / "start_images" / "si_0123456789ab.png"
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    return dataclasses.replace(
+        make_spec(data_root, job_id), job_type="start_image", keyframe_path=image
+    )
+
+
+def test_start_image_job_is_recorded_as_a_single_video(
+    store: HistoryStore, data_root: Path
+):
+    """P8（決定D26）: 開始画像つきは履歴上「個別動画」として記録する。
+
+    `_JOB_TYPES` も history.json のスキーマも変えないので、過去のコミットへ
+    戻しても履歴が読める。開始画像つきかどうかは
+    `parent_id is None and keyframe_path is not None` で判別する。
+    """
+    store.load()
+    spec = _start_image_spec(data_root)
+    record = HistoryRecord.from_job_spec(
+        spec,
+        identity=IDENTITY,
+        execution_engine="mock",
+        app_version="1.0.0",
+        data_root=data_root,
+        created_at=T0,
+    )
+
+    assert record.type == "single"
+    assert record.parent_id is None
+    assert record.keyframe_path == "start_images/si_0123456789ab.png"
+
+    store.add(record)
+    raw = read_doc(store.path)["records"][0]
+    assert raw["type"] == "single"
+    assert raw["keyframe_path"] == "start_images/si_0123456789ab.png"
+    assert raw["parent_id"] is None
+
+    # 別インスタンスで読み直しても同じ（往復で壊れない）
+    reloaded = HistoryStore(store.path, data_root)
+    reloaded.load()
+    got = reloaded.get(record.id)
+    assert got.type == "single"
+    assert got.parent_id is None and got.keyframe_path is not None
+    assert got.keyframe_path == record.keyframe_path
+
+
+def test_start_image_job_is_a_chain_root(store: HistoryStore, data_root: Path):
+    """P8: 開始画像ジョブは親を持たないので、チェーンの根になる（非回帰）。"""
+    store.load()
+    root = HistoryRecord.from_job_spec(
+        _start_image_spec(data_root),
+        identity=IDENTITY,
+        execution_engine="mock",
+        app_version="1.0.0",
+        data_root=data_root,
+        created_at=T0,
+    )
+    store.add(root)
+    child_id = "v_20260810_120001_ch00"
+    store.add(
+        make_record(data_root, child_id, parent_id=root.id, job_type="continuation")
+    )
+
+    assert [r.id for r in store.resolve_chain(root.id)] == [root.id]
+    assert [r.id for r in store.resolve_chain(child_id)] == [root.id, child_id]

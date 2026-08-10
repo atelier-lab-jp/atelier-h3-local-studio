@@ -442,7 +442,7 @@ def test_submit_button_is_disabled_on_click_and_restored_afterwards(offline_demo
 
     # 2段目が本体の投入。3段目が再有効化で、2段目の直後にぶら下がっている
     submit_fn_index = next(
-        i for i, fn in order if fn.api_name == "on_submit_v2"
+        i for i, fn in order if fn.api_name == "on_submit_v3"
     )
     submit_fn = demo.fns[submit_fn_index]
     assert submit_fn.trigger_after == disable_index

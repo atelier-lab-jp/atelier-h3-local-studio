@@ -46,11 +46,25 @@ iPhone 対応・文言・二重投入防止（P5・§6.1〜§6.4）:
 - **LANモード**: `lan_info` があれば接続先URLの案内を常時表示する。
   `lan_info` に PIN は含まれない（**UI へ PIN を到達させない設計**。PIN は Mac の画面だけ）。
 
+開始画像（P8・設計書 §28）:
+- ①新規生成タブの左カラムに「開始画像（任意）」を置く。選ばれた画像は
+  `AppService.prepare_start_image()` が 576×320 の PNG へ正規化し、UI は
+  **サーバが採番した ID（`si_xxxxxxxxxxxx`）だけ**を隠しテキストボックスで持つ。
+  保存先のパスはブラウザへ返さない（プレビューは**画像そのもの**を返す）。
+- **`gr.State` は1つも増やさない**（隠し `gr.Textbox` を使う）。
+- **継続モードと開始画像は排他**。継続元の親IDが入った瞬間に開始画像欄を隠して
+  ID を外し、解除で戻す。`on_start_continuation` の戻り値を増やさないよう、
+  この出し入れは親IDの `.change` を見る**独立した配線**で行う。
+- **Timer は開始画像の部品に一切触れない**（毎秒の更新で選択が消えないように）。
+- AppService 側の P8 API（`prepare_start_image` と `start_image_id` を受ける
+  `submit_generation(_ex)`）が欠けている版では、開始画像欄を**表示しない**。
+
 API 互換（P1〜P3 の回帰防止）:
 - `/on_submit` `/on_tick` `/on_estimate_change` `/on_insert_hint` `/on_queue_tick`
   `/on_cancel_queued` `/on_restart_worker` は引数・戻り値の数と順序を変えない。
-  継続生成に対応した投入は **新しい `/on_submit_v2`** として追加し、
-  `/on_submit`（5引数）は API 専用の非表示ボタンに残してある。
+  継続生成に対応した投入は **`/on_submit_v2`**、開始画像に対応した投入は
+  **新しい `/on_submit_v3`（7引数）**として追加する。`/on_submit`（5引数）と
+  `/on_submit_v2`（6引数）は API 専用の非表示ボタンに残してある。
 - P5 で `/on_select_video` の戻り値は 2→**3**（プレビュー・詳細・「詳しい情報」）へ
   増やした。上の7つの固定 API は変えていない。
 - **P7 で ④「履歴」を閲覧専用にした（決定D22）**。動画への操作は③へ一本化し、
@@ -63,8 +77,10 @@ from __future__ import annotations
 
 import html
 import inspect
+import io
 import logging
 import math
+import re
 import time
 import warnings
 from datetime import datetime
@@ -98,6 +114,14 @@ from app.core.history import HistoryError
 
 if TYPE_CHECKING:  # LANモード（P5）。A の実装前でも import 失敗で落ちないようにする
     from app.core.network import LanInfo
+
+try:  # 開始画像（P8）。この層が無い版でも UI は起動する（欄を出さないだけ）
+    from app.core.start_image import StartImageError
+except Exception:  # pragma: no cover - 実装前・import 失敗の保険
+
+    class StartImageError(Exception):
+        """`app.core.start_image` が無い版のための代替（利用者向け日本語のみ）。"""
+
 
 log = logging.getLogger("atelier.ui")
 
@@ -321,6 +345,45 @@ UPSCALE_ALREADY_NOTE = (
     "これは1080pの高品質版です。**これ以上の高品質化はできません。**"
     "プレビュー・Finder表示・整理はそのまま使えます。"
 )
+
+#: 開始画像（P8・設計書 §28）。**Ref2VA ではなく FL2VA の第1フレーム条件**であり、
+#: 参照動画・参照音楽・複数画像は V1 では扱わない（実測 2,925秒で不採用）。
+START_IMAGE_TITLE = "### 開始画像（任意）"
+START_IMAGE_NOTE = (
+    "画像を指定すると、その画像を動画の第1フレームとして使用します。"
+    "指定しない場合は、これまでどおりプロンプトだけで生成します。\n\n"
+    f"高解像度の写真やイラストはアプリ内で {FIXED_WIDTH}×{FIXED_HEIGHT} へ整えます"
+    "（PNG・JPEG・WebP に対応）。"
+    "画像は引き伸ばさず、動画の形（横長）に合わせて周囲を切り取ります。"
+    "重要な人物や物は画像の中央付近に配置してください。\n\n"
+    "※ iPhone の HEIC 形式は使えません。［設定］→［カメラ］→［フォーマット］を"
+    "「互換性優先」にするか、写真アプリから JPEG で書き出してください。"
+)
+START_IMAGE_LABEL = "開始画像（任意）"
+START_IMAGE_PREVIEW_LABEL = (
+    f"この画像から動画を開始します（{FIXED_WIDTH}×{FIXED_HEIGHT}）"
+)
+START_IMAGE_SELECTED = "✅ この画像を動画の第1フレームとして使用します。"
+START_IMAGE_CLEAR_LABEL = "開始画像を外す"
+#: 生成ボタンのすぐ上に出す補助表示（開始画像があるときだけ）
+START_IMAGE_SUBMIT_HINT = "ℹ️ 開始画像つきで生成します。"
+#: 投入結果メッセージへ添える印
+START_IMAGE_SUFFIX = "（開始画像つき）"
+#: 開始画像ID の形（サーバが採番する。**パス区切りを含まない**ことをここで担保する）
+START_IMAGE_ID_PATTERN = re.compile(r"^si_[0-9a-f]{12}$")
+START_IMAGE_UNSUPPORTED = (
+    "⚠️ この版では開始画像からの生成に対応していません（アプリの更新が必要です）。"
+)
+#: 想定外の失敗。**例外文・内部パスは画面へ出さない**（原因はログへ記録する）
+START_IMAGE_GENERIC_ERROR = (
+    "❌ 画像を読み込めませんでした。もう一度選び直してください"
+    "（別の画像でもうまくいかないときは「詳しい情報（アプリの動作ログ）」を"
+    "ご確認ください）。"
+)
+START_IMAGE_NOT_FOUND = (
+    "選んだ開始画像が見つかりません。もう一度選び直してください"
+)
+START_IMAGE_CONFLICT = "継続元と開始画像は同時に指定できません"
 
 CUSTOM_ADD_LABEL = "＋ 連結候補へ追加"
 CUSTOM_UP_LABEL = "↑ 1つ上へ"
@@ -1087,6 +1150,30 @@ def build_ui(
             return True
         return "parent_id" in params and "keyframe_path" in params
 
+    def _submit_accepts_start_image() -> bool:
+        """投入口が `start_image_id` を受けるか調べる（P8）。
+
+        `submit_generation_ex` があればそちらを見る（UI が実際に使う入口だから）。
+        """
+        target = getattr(service, "submit_generation_ex", None) or getattr(
+            service, "submit_generation", None
+        )
+        if target is None:  # pragma: no cover - AppService には必ずある
+            return False
+        try:
+            params = inspect.signature(target).parameters
+        except (TypeError, ValueError):  # pragma: no cover - 実装依存
+            return False
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return True
+        return "start_image_id" in params
+
+    #: P8: 正規化の入口と投入口の**両方**が揃っているときだけ開始画像欄を出す。
+    #: 片方だけの版で欄を出すと「選べるのに登録できない」画面になってしまう。
+    _has_start_image = (
+        hasattr(service, "prepare_start_image") and _submit_accepts_start_image()
+    )
+
     def _servable(path, *, allow_tmp: bool = False) -> Path | None:
         """ブラウザへ渡してよいパスだけを通す（設計書 §15）。
 
@@ -1580,8 +1667,20 @@ def build_ui(
 
     # ---------------------------------------------------------------- callbacks
 
-    def _do_submit(prompt, length_label, step_label, seed_random, seed_value, parent_id):
-        """①の投入処理本体（単発／継続の両方。キューへ登録して即座に戻る）。"""
+    def _do_submit(
+        prompt,
+        length_label,
+        step_label,
+        seed_random,
+        seed_value,
+        parent_id,
+        start_image_id="",
+    ):
+        """①の投入処理本体（単発／継続／開始画像。キューへ登録して即座に戻る）。
+
+        `start_image_id` はサーバが採番した ID だけを受け取る（P8）。画像のパスは
+        ブラウザから受け取らない（AppService 側が ID からパスを解決する）。
+        """
         num_frames = LENGTH_CHOICES.get(length_label, cfg.default_num_frames)
         steps = STEP_CHOICES.get(step_label, cfg.default_steps)
 
@@ -1601,8 +1700,12 @@ def build_ui(
                 return "❌ シード値は整数で入力してください", header, progress
 
         parent = str(parent_id or "").strip()
+        image_id = str(start_image_id or "").strip()
         extra: dict = {}
         try:
+            if parent and image_id:
+                # 画面上は排他だが、API を直接叩かれても通さない（P8・決定D25）
+                raise ValidationError(START_IMAGE_CONFLICT)
             if parent:
                 # キーフレームのパスはブラウザから受け取らず、必ずここで取り直す。
                 if not _has_continuation:
@@ -1618,6 +1721,16 @@ def build_ui(
                     "parent_id": getattr(ctx, "parent_id", parent),
                     "keyframe_path": getattr(ctx, "keyframe_path", None),
                 }
+            elif image_id:
+                # 開始画像は ID の形をここでも確かめる（UI を迂回した値を通さない）
+                if not START_IMAGE_ID_PATTERN.match(image_id):
+                    raise ValidationError(START_IMAGE_NOT_FOUND)
+                if not _has_start_image:
+                    raise ValidationError(
+                        "この版では開始画像からの生成に対応していません"
+                        "（アプリの更新が必要です）"
+                    )
+                extra = {"start_image_id": image_id}
             submit_kwargs = dict(
                 prompt=prompt or "",
                 num_frames=num_frames,
@@ -1634,10 +1747,16 @@ def build_ui(
             else:
                 view = service.submit_generation(**submit_kwargs)
                 duplicate = False
-            kind = f"継続生成（親: {parent}）" if parent else "新規生成"
+            if parent:
+                kind = f"継続生成（親: {parent}）"
+            elif image_id:
+                kind = f"新規生成{START_IMAGE_SUFFIX}"
+            else:
+                kind = "新規生成"
             if duplicate:
                 message = (
-                    f"ℹ️ 同じ内容がすでに登録されています: **{view.job_id}**\n\n"
+                    f"ℹ️ 同じ内容がすでに登録されています: **{view.job_id}**"
+                    f"{START_IMAGE_SUFFIX if image_id else ''}\n\n"
                     "続けて2回押されたため、**1件だけ**登録しました。"
                     "同じ内容をもう1本作りたいときは、数秒おいてからもう一度押してください。"
                 )
@@ -1672,9 +1791,36 @@ def build_ui(
     def on_submit_v2(
         prompt, length_label, step_label, seed_random, seed_value, parent_id
     ):
-        """継続対応の投入 API（P4。`parent_id` が空なら単発生成と同じ挙動）。"""
+        """継続対応の投入 API（P4。`parent_id` が空なら単発生成と同じ挙動）。
+
+        P8 以降も**6引数のまま**（開始画像は受け取らない）。画面のボタンは
+        `/on_submit_v3` を使い、こちらは互換用の非表示ボタンに残してある。
+        """
         return _do_submit(
             prompt, length_label, step_label, seed_random, seed_value, parent_id
+        )
+
+    def on_submit_v3(
+        prompt,
+        length_label,
+        step_label,
+        seed_random,
+        seed_value,
+        parent_id,
+        start_image_id,
+    ):
+        """開始画像に対応した投入 API（P8。7引数）。
+
+        `start_image_id` が空なら `/on_submit_v2` と1バイトも変わらない挙動になる。
+        """
+        return _do_submit(
+            prompt,
+            length_label,
+            step_label,
+            seed_random,
+            seed_value,
+            parent_id,
+            start_image_id,
         )
 
     def on_tick():
@@ -1735,6 +1881,126 @@ def build_ui(
         空欄で押しても空文字を返すだけで、例外にはならない。
         """
         return ""
+
+    # ------------------------------------------- 開始画像（P8・設計書 §28）
+    #
+    # UI が持つのは**サーバが採番した ID だけ**で、保存先のパスは持たない。
+    # プレビューは画像そのもの（PIL）を返すので、`data/start_images/` を
+    # HTTP 配信対象へ入れる必要がない（`allowed_paths` も `_servable()` も無変更）。
+
+    def _upload_root() -> Path | None:
+        """Gradio が受信ファイルを置く場所（下位層はこの配下だけを受け付ける）。
+
+        取得できない版では None を返す（境界検証は AppService 側の既定に従う）。
+        """
+        try:
+            from gradio.utils import get_upload_folder
+
+            return Path(get_upload_folder()).resolve()
+        except Exception:  # pragma: no cover - Gradio の版差でも UI は動かす
+            log.warning("アップロード先の場所を特定できませんでした", exc_info=True)
+            return None
+
+    def _start_image_state(
+        *, image_id: str = "", message: str = "", selected: bool = False, preview=None
+    ) -> tuple:
+        """開始画像欄の6部品をまとめて更新する（順序は `start_image_outputs`）。"""
+        return (
+            image_id,
+            gr.update(value=preview, visible=selected),
+            gr.update(value=message, visible=bool(message)),
+            gr.update(visible=not selected),  # 未選択のときだけ説明を出す
+            gr.update(visible=selected),
+            gr.update(
+                value=(START_IMAGE_SUBMIT_HINT if selected else ""), visible=selected
+            ),
+        )
+
+    def _start_image_preview(result):
+        """プレビュー用の画像を作る（**パスではなく画像そのもの**を返す）。"""
+        data = getattr(result, "png_bytes", None)
+        if not data:
+            return None
+        try:
+            from PIL import Image as PILImage
+
+            with PILImage.open(io.BytesIO(data)) as img:
+                return img.convert("RGB")
+        except Exception:  # 設計書 §13.2: UI は落とさない
+            log.exception("開始画像のプレビューを作れませんでした")
+            return None
+
+    def _start_image_message(result) -> str:
+        """選択後の説明（警告は `StartImageResult.warnings` をそのまま出す）。"""
+        lines = [START_IMAGE_SELECTED]
+        size = getattr(result, "source_size", None)
+        fmt = str(getattr(result, "source_format", "") or "")
+        if getattr(result, "passthrough", False):
+            lines.append(
+                f"元の画像は {FIXED_WIDTH}×{FIXED_HEIGHT} なので、そのまま使います。"
+            )
+        elif isinstance(size, (tuple, list)) and len(size) == 2:
+            source = f"{size[0]}×{size[1]}" + (f"・{fmt}" if fmt else "")
+            lines.append(
+                f"元の画像（{source}）を {FIXED_WIDTH}×{FIXED_HEIGHT} に整えました。"
+            )
+        for warning in getattr(result, "warnings", ()) or ():
+            lines.append(f"⚠️ {warning}")
+        return "\n\n".join(lines)
+
+    def on_start_image_selected(path):
+        """開始画像を選んだとき（外したときは空で呼ばれる）。
+
+        正規化に失敗したら**日本語の理由だけ**を出し、IDは空のままにする。
+        内部パス・例外文はここから画面へ出さない（原因はログへ記録する）。
+        """
+        if not path:
+            return _start_image_state()
+        if not _has_start_image:
+            return _start_image_state(message=START_IMAGE_UNSUPPORTED)
+        try:
+            result = service.prepare_start_image(path, upload_root=_upload_root())
+        except (StartImageError, ValidationError) as e:
+            return _start_image_state(message=f"❌ {e}")
+        except Exception:  # 設計書 §13.2
+            log.exception("開始画像の準備に失敗しました")
+            return _start_image_state(message=START_IMAGE_GENERIC_ERROR)
+
+        image_id = str(getattr(result, "start_image_id", "") or "")
+        if not START_IMAGE_ID_PATTERN.match(image_id):
+            log.error("開始画像IDの形式が想定と違います（登録を中止しました）")
+            return _start_image_state(message=START_IMAGE_GENERIC_ERROR)
+        preview = _start_image_preview(result)
+        if preview is None:
+            return _start_image_state(message=START_IMAGE_GENERIC_ERROR)
+        return _start_image_state(
+            image_id=image_id,
+            message=_start_image_message(result),
+            selected=True,
+            preview=preview,
+        )
+
+    def on_clear_start_image():
+        """［開始画像を外す］。
+
+        **引数を取らず、固定値だけを返す**（`on_clear_prompt` と同じ形）。
+        プロンプト・長さ・ステップ・シード・キュー・履歴はこの関数から見えない。
+        """
+        return (None, *_start_image_state())
+
+    def on_continuation_mode_changed(parent_id):
+        """継続モードと開始画像の排他（P8・決定D25）。
+
+        継続元の親IDが入ったら開始画像欄を隠して選択を外し、解除で元に戻す。
+        `on_start_continuation` の戻り値を増やさないため、**親IDの変化を見る
+        独立した配線**にしてある（既存テストのタプル分解を壊さない）。
+        """
+        active = bool(str(parent_id or "").strip())
+        return (
+            gr.update(visible=_has_start_image and not active),
+            None,
+            *_start_image_state(),
+        )
 
     # ---------------------------------------------------- ②キュータブの callbacks
 
@@ -2442,7 +2708,21 @@ def build_ui(
                 message=r".*moved from the Blocks constructor to the launch\(\) method.*",
                 category=UserWarning,
             )
-            demo = gr.Blocks(title=cfg.name, analytics_enabled=False, css=MOBILE_CSS)
+            # P8: 利用者が選んだ元画像と、正規化後のプレビューは Gradio のキャッシュ
+            # （`$TMPDIR/gradio`。`data/` の外）へ置かれる。放っておくと無期限に
+            # 溜まるので、1時間ごとに**24時間より古い**ものだけを掃除する。
+            # **`delete_cache` は Blocks の引数**で、launch() は受け取らない。
+            #
+            # 「1時間より古いものを消す」にしないのは、③完成・編集タブの動画も
+            # 同じキャッシュへ複製されるため。短い保持時間にすると、開いたままの
+            # ページで再生中の動画の実体が消えて 404 になりうる（P6 の
+            # `data/upscaled` 配信漏れと同じ「画面には出るのに再生できない」事故）。
+            demo = gr.Blocks(
+                title=cfg.name,
+                analytics_enabled=False,
+                css=MOBILE_CSS,
+                delete_cache=(3600, 24 * 3600),
+            )
     except TypeError:  # 古い/新しい Gradio の差異でも起動を止めない
         demo = gr.Blocks(title=cfg.name)
 
@@ -2499,6 +2779,51 @@ def build_ui(
                                 "プロンプトを消去", size="sm", variant="secondary"
                             )
 
+                        # ---- 開始画像（P8・設計書 §28）。継続モードとは排他。
+                        # AppService 側の P8 API が無い版では丸ごと隠す。
+                        with gr.Group(visible=_has_start_image) as start_image_group:
+                            gr.Markdown(START_IMAGE_TITLE)
+                            start_image_note = gr.Markdown(
+                                START_IMAGE_NOTE, elem_classes=["h3-note"]
+                            )
+                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                                # `image_mode=None` にすると Gradio は画素を変換せず
+                                # 受け取ったファイルのパスをそのまま渡す。形式の判定と
+                                # 正規化は下位層（app.core.start_image）が一手に行う。
+                                start_image_input = gr.Image(
+                                    label=START_IMAGE_LABEL,
+                                    type="filepath",
+                                    image_mode=None,
+                                    sources=["upload"],
+                                    format="png",
+                                    height=180,
+                                    show_label=True,
+                                )
+                                start_image_preview = gr.Image(
+                                    label=START_IMAGE_PREVIEW_LABEL,
+                                    interactive=False,
+                                    format="png",
+                                    height=180,
+                                    visible=False,
+                                )
+                            start_image_msg = gr.Markdown("", visible=False)
+                            # ［開始画像を外す］は **`h3-tap` の行に入れる**。
+                            # `.h3-tap button` にだけ 44px の最低高さが効くので、
+                            # 直接 Group の子に置くと iPhone で 28px になってしまう
+                            # （実機相当のヘッドレス描画で確認済み）。
+                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                                start_image_clear_btn = gr.Button(
+                                    START_IMAGE_CLEAR_LABEL,
+                                    size="sm",
+                                    elem_classes=["h3-btn"],
+                                    visible=False,
+                                )
+                        # 開始画像は ID だけを持つ（**`gr.State` は増やさない**）。
+                        # 保存先のパスはブラウザへ渡さないし、受け取りもしない。
+                        start_image_id = gr.Textbox(
+                            value="", visible=False, label="開始画像ID"
+                        )
+
                         length_radio = gr.Radio(
                             choices=list(LENGTH_CHOICES.keys()),
                             value=_length_label(cfg.default_num_frames),
@@ -2523,6 +2848,8 @@ def build_ui(
                                 _step_label(cfg.default_steps),
                             )
                         )
+                        # 開始画像があるときだけ、生成ボタンのすぐ上に印を出す（P8）
+                        start_image_hint_md = gr.Markdown("", visible=False)
                         submit_btn = gr.Button(
                             SUBMIT_LABEL, variant="primary", elem_classes=["h3-tap"]
                         )
@@ -2826,7 +3153,7 @@ def build_ui(
             outputs=submit_btn,
             api_name=False,
         ).then(
-            on_submit_v2,
+            on_submit_v3,
             inputs=[
                 prompt_box,
                 length_radio,
@@ -2834,9 +3161,10 @@ def build_ui(
                 seed_random,
                 seed_number,
                 continuation_parent,
+                start_image_id,
             ],
             outputs=[submit_msg, header_md, progress_md],
-            api_name="on_submit_v2",
+            api_name="on_submit_v3",
         ).then(
             lambda: gr.update(interactive=True, value=SUBMIT_LABEL),
             outputs=submit_btn,
@@ -2850,6 +3178,53 @@ def build_ui(
             inputs=[prompt_box, length_radio, step_radio, seed_random, seed_number],
             outputs=[submit_msg, header_md, progress_md],
             api_name="on_submit",
+        )
+        # P4 互換の `/on_submit_v2`（6引数・3戻り値）も同じ手口で残す（P8）。
+        # 画面のボタンは `/on_submit_v3`（＋開始画像ID）を使う。
+        legacy_submit_v2_btn = gr.Button(
+            "（互換API）生成をキューに追加（継続対応）", visible=False
+        )
+        legacy_submit_v2_btn.click(
+            on_submit_v2,
+            inputs=[
+                prompt_box,
+                length_radio,
+                step_radio,
+                seed_random,
+                seed_number,
+                continuation_parent,
+            ],
+            outputs=[submit_msg, header_md, progress_md],
+            api_name="on_submit_v2",
+        )
+        # ---- 開始画像（P8）。**Timer はこれらの部品に一切触れない**ので、
+        # 1秒ごとの更新で選択やプレビューが消えることはない。
+        start_image_outputs = [
+            start_image_id,
+            start_image_preview,
+            start_image_msg,
+            start_image_note,
+            start_image_clear_btn,
+            start_image_hint_md,
+        ]
+        start_image_input.change(
+            on_start_image_selected,
+            inputs=start_image_input,
+            outputs=start_image_outputs,
+            api_name="on_start_image",
+        )
+        start_image_clear_btn.click(
+            on_clear_start_image,
+            outputs=[start_image_input, *start_image_outputs],
+            api_name="on_clear_start_image",
+        )
+        # 継続モードとの排他。`on_start_continuation` の戻り値を増やさないため、
+        # 親ID（隠しテキストボックス）の変化を見る独立した配線にしてある。
+        continuation_parent.change(
+            on_continuation_mode_changed,
+            inputs=continuation_parent,
+            outputs=[start_image_group, start_image_input, *start_image_outputs],
+            api_name=False,
         )
         hint_btn.click(on_insert_hint, inputs=prompt_box, outputs=prompt_box)
         # 繰り返し使う操作なので確認は挟まない。**outputs はプロンプト欄だけ**に

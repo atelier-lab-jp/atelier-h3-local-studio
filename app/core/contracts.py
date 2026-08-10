@@ -247,9 +247,12 @@ class JobSpec:
     output_path: Path
     last_frame_path: Path
     backend_id: str = SUPPORTED_BACKENDS[0]
-    job_type: str = "single"  # "single" | "continuation"（継続生成は P4）
+    #: "single" | "continuation"（継続生成は P4）| "start_image"（開始画像は P8）
+    job_type: str = "single"
     parent_id: str | None = None
-    keyframe_path: Path | None = None  # 継続生成用（P1 では常に None）
+    #: 第1フレームとして渡す画像（継続生成の親の最終フレーム、または P8 の開始画像）。
+    #: 単発生成では常に None（P1 と同じ）。
+    keyframe_path: Path | None = None
     width: int = FIXED_WIDTH
     height: int = FIXED_HEIGHT
     fps: int = FIXED_FPS
@@ -452,10 +455,14 @@ def validate_job_spec(
             f"未対応の生成バックエンドです（指定: {spec.backend_id}、許可: {allowed}）"
         )
 
-    if spec.job_type not in ("single", "continuation"):
+    if spec.job_type not in ("single", "continuation", "start_image"):
         raise ValidationError(f"ジョブ種別が不正です: {spec.job_type}")
 
-    # 単発と継続で必須項目は排他（P4）。UI を迂回した中途半端な指定を弾く。
+    # 種別ごとに必須項目は排他（P4・P8）。UI を迂回した中途半端な指定を弾く。
+    #
+    # **単発（single）が keyframe_path を拒否する条件は P8 でも一切緩めていない**。
+    # 開始画像からの生成は job_type="start_image" という別種別として通し、
+    # 「単発生成なのに画像が付いている」という不整合は今までどおり必ず失敗させる。
     if spec.job_type == "continuation":
         if not spec.parent_id:
             raise ValidationError("継続生成には継続元（親動画）のIDが必要です")
@@ -463,6 +470,12 @@ def validate_job_spec(
             raise ValidationError("継続生成には親動画の最終フレーム画像が必要です")
         if data_root is not None:
             _require_within(data_root, spec.keyframe_path, "継続元のキーフレーム画像")
+    elif spec.job_type == "start_image":
+        # 開始画像からの生成（P8）。継続生成と違い親ジョブを持たない**根**になる。
+        if spec.parent_id is not None:
+            raise ValidationError("開始画像からの生成に継続元IDは指定できません")
+        if spec.keyframe_path is None:
+            raise ValidationError("開始画像からの生成には開始画像が必要です")
     else:
         if spec.parent_id is not None:
             raise ValidationError(
@@ -470,6 +483,12 @@ def validate_job_spec(
             )
         if spec.keyframe_path is not None:
             raise ValidationError("単発生成にキーフレーム画像は指定できません")
+
+    # キーフレーム画像があるなら、種別によらずアプリのデータ領域の中を要求する。
+    # 継続生成は上でも同じ検査をしているが（先に固有の文言で断るため）、
+    # ここを種別非依存にしておくと種別が増えても領域外パスの抜け道ができない。
+    if data_root is not None and spec.keyframe_path is not None:
+        _require_within(data_root, spec.keyframe_path, "開始画像")
 
     if data_root is not None:
         for label, path in (

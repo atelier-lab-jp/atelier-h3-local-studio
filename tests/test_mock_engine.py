@@ -651,6 +651,59 @@ def test_keyframe_rejection_matches_real_engine(tmp_path):
     )
 
 
+# ---------------------------------------------------------------- 開始画像（P8）
+
+
+def _start_image_spec(tmp_path, image: Path, **overrides) -> JobSpec:
+    params = {
+        "job_id": "v_20260810_120000_si00",
+        "job_type": "start_image",
+        "keyframe_path": image,
+    }
+    params.update(overrides)
+    return _spec(tmp_path, **params)
+
+
+def test_start_image_job_produces_the_same_artifacts(make_engine, tmp_path):
+    """P8: 開始画像つきでも成果物の形・イベント列は単発／継続とまったく同じ。"""
+    engine = make_engine()
+    _start_ready(engine)
+    image = _write_png(tmp_path / "start_images" / "si_0123456789ab.png")
+    spec = _start_image_spec(tmp_path, image)
+
+    events = _run_job(engine, spec)
+    done = events[-1]
+
+    assert _types(events) == [
+        "stage",
+        "progress",
+        "progress",
+        "progress",
+        "progress",
+        "stage",
+        "done",
+    ]
+    assert done.type is EventType.DONE
+    assert done.output_path == spec.output_path and done.output_path.is_file()
+    assert done.last_frame_path == spec.last_frame_path
+    assert done.seed_used == 42
+    assert done.warnings == ()
+    # 開始画像は読むだけ（書き換えない）
+    assert image.is_file() and image.stat().st_size > 0
+    assert engine.state() is EngineState.READY
+
+
+def test_start_image_job_rejects_a_missing_image(make_engine, tmp_path):
+    """P8: 実在しない開始画像は継続生成と同じ文言で同期拒否する。"""
+    engine = make_engine()
+    _start_ready(engine)
+    missing = tmp_path / "start_images" / "si_ffffffffffff.png"
+
+    with pytest.raises(ValidationError, match="見つかりません"):
+        engine.submit(_start_image_spec(tmp_path, missing))
+    assert engine.state() is EngineState.READY
+
+
 # ---------------------------------------------------------------- 状態遷移
 
 

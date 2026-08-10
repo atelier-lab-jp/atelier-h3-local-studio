@@ -286,6 +286,30 @@ class ContinuationContext:
 #: 継続プロンプトの先頭に付ける定型（設計書 §10.5）
 CONTINUATION_PREFIX = "Continue directly from the supplied first frame."
 
+#: 開始画像つき生成で自動付与する定型（P8）。PoC で実測検証した文言。
+#: CONTINUATION_PREFIX と同文だが**用途が違うので別シンボル**にしてある
+#: （片方だけ文言を変えられるようにするため）。
+START_IMAGE_PREFIX = "Continue directly from the supplied first frame."
+
+
+def with_start_image_prefix(prompt: str) -> str:
+    """開始画像つきプロンプトの先頭に定型を**冪等に**付ける（2回付かない）。
+
+    空文字・空白だけのプロンプトはそのまま返す。ここで定型を足してしまうと
+    「プロンプトを入力してください」という既存の検証を素通りしてしまうため。
+    """
+    text = str(prompt or "")
+    if not text.strip():
+        return text
+    if text.startswith(START_IMAGE_PREFIX):
+        return text
+    return f"{START_IMAGE_PREFIX}\n{text}".strip()
+
+
+def _clean_start_image_id(value) -> str:
+    """UI から来た開始画像ID を正規化する（未選択は空文字に潰す）。"""
+    return str(value).strip() if value else ""
+
 
 @dataclass(frozen=True)
 class SubmitResult:
@@ -538,9 +562,26 @@ class AppService:
         seed_requested: int | None,
         parent_id: str | None = None,
         keyframe_path: Path | None = None,
+        start_image_path: Path | None = None,
     ) -> JobSpec:
+        """1件分の JobSpec を作る（ID採番・出力パス決定・検証つき）。
+
+        `start_image_path` を渡すと開始画像からの生成（P8）になる。継続生成
+        （`parent_id` / `keyframe_path`）とは**同時に指定できない**。
+        """
         job_id = self._new_job_id()
         is_continuation = parent_id is not None or keyframe_path is not None
+        if is_continuation and start_image_path is not None:
+            raise ValidationError("継続元と開始画像は同時に指定できません")
+        if is_continuation:
+            job_type = "continuation"
+        elif start_image_path is not None:
+            job_type = "start_image"
+            # 開始画像も「第1フレームとして渡す画像」なので、下位層（エンジン・
+            # ワーカー）から見た形は継続生成とまったく同じ keyframe_path になる。
+            keyframe_path = start_image_path
+        else:
+            job_type = "single"
         spec = JobSpec(
             job_id=job_id,
             prompt=prompt,
@@ -550,7 +591,7 @@ class AppService:
             output_path=self.cfg.outputs_dir / f"{job_id}.mp4",
             last_frame_path=self.cfg.outputs_dir / f"{job_id}_last.png",
             backend_id=self.cfg.backend_id,
-            job_type="continuation" if is_continuation else "single",
+            job_type=job_type,
             parent_id=parent_id,
             keyframe_path=keyframe_path,
             # 解像度・fps は実機検証済みの固定値（config.py が変更を拒否済み）
@@ -564,6 +605,19 @@ class AppService:
             seed_max=self.cfg.seed_max,
         )
         return spec
+
+    def prepare_start_image(self, src_path, *, upload_root=None):
+        """開始画像（P8）を検証・正規化して staging へ置く（キューには触れない）。
+
+        UI はこの戻り値（`StartImageResult`）のプレビューと注意書きを出すだけで、
+        ジョブ用の正式パスは投入時（`submit_generation`）に初めて確定する。
+        失敗は日本語メッセージだけを持つ `StartImageError` で返る。
+        """
+        from app.core.start_image import normalize_start_image
+
+        return normalize_start_image(
+            src_path, data_root=self.cfg.data_root, upload_root=upload_root
+        )
 
     def intake_block_reason(self) -> str | None:
         """空き容量が受付停止水準なら日本語の理由を返す（設計書 §13.2）。"""
@@ -595,15 +649,32 @@ class AppService:
         seed_requested: int | None,
         parent_id: str | None = None,
         keyframe_path: Path | None = None,
+        start_image_id: str | None = None,
     ) -> JobView:
         """UI からの投入口。キューへ登録して即座に戻る（生成完了を待たない）。
 
         `parent_id` / `keyframe_path` を渡すと継続生成になる（P4）。
         継続元の妥当性は `continuation_context()` が事前に検証している前提だが、
         ここでも `validate_job_spec` を通すので UI を迂回した指定は弾かれる。
+
+        `start_image_id` を渡すと開始画像からの生成になる（P8）。staging にある
+        正規化済み画像を**ジョブ用の正式パスへ確定してから**投入するので、
+        投入後に利用者が別の画像を選び直しても、登録済みジョブの画像は変わらない。
         """
         self.check_disk_guard()
-        if parent_id is not None:
+        start_image_id = _clean_start_image_id(start_image_id)
+        start_image_path: Path | None = None
+        created_start_image = False
+        if start_image_id:
+            if parent_id is not None or keyframe_path is not None:
+                raise ValidationError("継続元と開始画像は同時に指定できません")
+            from app.core.start_image import commit_start_image
+
+            start_image_path, created_start_image = commit_start_image(
+                start_image_id, data_root=self.cfg.data_root
+            )
+            prompt = with_start_image_prefix(prompt)
+        elif parent_id is not None:
             # 継続元は投入時に必ず再検証する（UI の「押した瞬間に日本語で断る」体験のため）。
             # ここを通さないとキーフレーム欠損がエンジン層まで進み FAILED になってしまう。
             ctx = self.continuation_context(parent_id)
@@ -613,20 +684,38 @@ class AppService:
                 raise ValidationError(
                     "継続元の最終フレーム画像が指定と一致しません（継続元を選び直してください）"
                 )
-        spec = self.build_spec(
-            prompt=prompt,
-            num_frames=num_frames,
-            steps=steps,
-            seed_requested=seed_requested,
-            parent_id=parent_id,
-            keyframe_path=keyframe_path,
-        )
-        view = self.queue.submit(spec)
+        try:
+            spec = self.build_spec(
+                prompt=prompt,
+                num_frames=num_frames,
+                steps=steps,
+                seed_requested=seed_requested,
+                parent_id=parent_id,
+                keyframe_path=keyframe_path,
+                start_image_path=start_image_path,
+            )
+            view = self.queue.submit(spec)
+        except Exception:
+            # 登録できなかったジョブのために確定した画像は片づける。
+            # **この呼び出しで新規作成したときだけ**消す（同じ画像を使う他の
+            # ジョブが既に居るなら、その正式パスは消してはいけない）。
+            if created_start_image and start_image_path is not None:
+                from app.core.start_image import discard_start_image
+
+                try:
+                    discard_start_image(start_image_path, data_root=self.cfg.data_root)
+                except Exception:
+                    log.exception(
+                        "投入に失敗した開始画像を片づけられませんでした: %s",
+                        start_image_path.name,
+                    )
+            raise
         log.info(
-            "ジョブを受け付けました: %s（%dフレーム / %dステップ）",
+            "ジョブを受け付けました: %s（%dフレーム / %dステップ%s）",
             spec.job_id,
             spec.num_frames,
             spec.steps,
+            " / 開始画像つき" if start_image_id else "",
         )
         return view
 
@@ -641,11 +730,15 @@ class AppService:
         seed_requested: int | None,
         parent_id: str | None,
         keyframe_path: Path | None,
+        start_image_id: str | None = None,
     ) -> str:
         """投入内容そのものからキーを作る（設計書 P5 §6.2 のキー定義）。
 
         ランダムシード（`seed_requested is None`）でも「同じ画面・同じ設定で
         続けて2回押した」ことは検出できる。時間窓を過ぎれば同じキーでも通る。
+
+        開始画像（P8）も内容の一部なので含める。**画像だけを選び直して
+        すぐ押し直した場合は別のジョブ**として通す必要があるため。
         """
         # ここでは値を変換しない（`int()` などを挟むと、不正な入力に対して
         # `validate_job_spec` の日本語エラーより先に別の例外が飛んでしまう）。
@@ -657,6 +750,7 @@ class AppService:
                 "-" if seed_requested is None else str(seed_requested),
                 str(parent_id or ""),
                 "" if keyframe_path is None else str(keyframe_path),
+                str(start_image_id or ""),
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -700,6 +794,7 @@ class AppService:
         seed_requested: int | None,
         parent_id: str | None = None,
         keyframe_path: Path | None = None,
+        start_image_id: str | None = None,
     ) -> SubmitResult:
         """二重投入を短時間だけ冪等化する投入口（UI はこちらを使う）。
 
@@ -711,6 +806,11 @@ class AppService:
         両方とも検査をすり抜けて2件登録されてしまう（生成は直列なので、
         投入自体を直列化しても待たされることはない）。
         """
+        # 定型の付与は投入時に行われるので、キーも**付与後のプロンプト**で作る
+        # （そうしないと「定型つきで押し直した」だけで別ジョブになってしまう）。
+        start_image_id = _clean_start_image_id(start_image_id)
+        if start_image_id:
+            prompt = with_start_image_prefix(prompt)
         key = self._idempotency_key(
             prompt=prompt,
             num_frames=num_frames,
@@ -718,6 +818,7 @@ class AppService:
             seed_requested=seed_requested,
             parent_id=parent_id,
             keyframe_path=keyframe_path,
+            start_image_id=start_image_id,
         )
         with self._submit_lock:
             now = self._submit_clock()
@@ -747,6 +848,8 @@ class AppService:
                 extra["parent_id"] = parent_id
             if keyframe_path is not None:
                 extra["keyframe_path"] = keyframe_path
+            if start_image_id:
+                extra["start_image_id"] = start_image_id
             view = self.submit_generation(
                 prompt=prompt,
                 num_frames=num_frames,

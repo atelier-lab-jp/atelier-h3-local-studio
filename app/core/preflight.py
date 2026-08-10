@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.core.config import SUPPORTED_BACKENDS, AppConfig
-from app.core import ffmpeg_ops
+from app.core import ffmpeg_ops, start_image
 from app.core.fileops import disk_free_gb, disk_state, list_orphan_partials
 
 # minimax_h3 バックエンド固有の資産検査（設計書 §0.1 で確定したローカルモデル配置。
@@ -222,7 +222,8 @@ def run_preflight(
     # データ領域の作成・書込可否
     try:
         for d in (cfg.outputs_dir, cfg.concat_dir, cfg.tmp_dir, cfg.logs_dir,
-                  cfg.upscaled_dir):
+                  cfg.upscaled_dir, cfg.start_images_dir,
+                  cfg.start_images_staging_dir):
             d.mkdir(parents=True, exist_ok=True)
         probe = cfg.tmp_dir / ".write_check"
         probe.write_text("ok", encoding="utf-8")
@@ -288,8 +289,22 @@ def run_preflight(
     result.warnings.extend(upscale.warnings)
     result.infos.extend(upscale.infos)
 
+    # 開始画像（P8）の一時領域を掃除する。プレビュー段階の画像は次の起動へ
+    # 持ち越さない（ジョブ用に確定した画像は `start_images/` 直下なので消えない）。
+    try:
+        removed = start_image.cleanup_staging(cfg.data_root)
+    except OSError as e:  # pragma: no cover - 実行環境依存
+        result.warnings.append(f"開始画像の一時ファイルを片づけられませんでした: {e}")
+    else:
+        if removed:
+            result.infos.append(
+                f"開始画像の一時ファイルを {removed} 件片づけました"
+            )
+
     # 孤児 partial の列挙（削除はしない。§10.7 手順6）
-    orphans = list_orphan_partials(cfg.outputs_dir, cfg.concat_dir, cfg.tmp_dir)
+    orphans = list_orphan_partials(
+        cfg.outputs_dir, cfg.concat_dir, cfg.tmp_dir, cfg.start_images_dir
+    )
     if orphans:
         names = ", ".join(p.name for p in orphans[:10])
         result.infos.append(

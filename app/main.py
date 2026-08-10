@@ -171,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
                 str(cfg.upscaled_dir),  # P6: 1080p高品質版
             ],
             "inbrowser": cfg.auto_open_browser and not args.smoke and not args.lan,
+            # 開始画像（P8）で受け取るファイルの上限。下位層は 32MB までしか
+            # 受け付けないので、それより少しだけ大きい値でサーバ側でも先に断る。
+            "max_file_size": "40mb",
         }
         if args.smoke:
             launch_kwargs["prevent_thread_lock"] = True
