@@ -1071,11 +1071,12 @@ def test_timer_outputs_exclude_video_players(tmp_path):
         assert not any(isinstance(o, gr.Image) for o in fn.outputs)
     assert seen == tick_names
 
-    # 継続開始は gr.Tabs を出力に持つ（①新規生成タブへ切り替えるため）
-    for api_name in ("on_start_continuation", "on_history_continuation"):
-        fn = next(f for f in demo.fns.values() if f.api_name == api_name)
-        assert any(isinstance(o, gr.Tabs) for o in fn.outputs), api_name
-        assert any(isinstance(o, gr.Image) for o in fn.outputs), api_name
+    # 継続開始は gr.Tabs を出力に持つ（①新規生成タブへ切り替えるため）。
+    # P7 で入口は③の on_start_continuation だけになった（④の分は廃止）
+    fn = next(f for f in demo.fns.values() if f.api_name == "on_start_continuation")
+    assert any(isinstance(o, gr.Tabs) for o in fn.outputs)
+    assert any(isinstance(o, gr.Image) for o in fn.outputs)
+    assert not any(f.api_name == "on_history_continuation" for f in demo.fns.values())
 
 
 # ------------------------------------------------------------ ④履歴タブ
@@ -1084,7 +1085,7 @@ def test_timer_outputs_exclude_video_players(tmp_path):
 def test_history_tab_lists_all_statuses(p4_app):
     """④は成功・失敗・取消・中断・異常データ（QUEUED/RUNNING）まで全部出す。"""
     client, _service, _cfg = p4_app
-    listing, choices = client.predict("すべて", api_name="/on_history_tick")
+    listing = client.predict("すべて", api_name="/on_history_tick")
 
     for job_id in (
         "v_p4_root",
@@ -1105,6 +1106,8 @@ def test_history_tab_lists_all_statuses(p4_app):
     # 個別と連結を識別できる（連結成果物は連結行としても並ぶ）
     assert "| 連結 |" in listing
     assert "| 個別 |" in listing
+    # P7: 記録の選択は③へ一本化した。選べることは③の候補で確かめる
+    _summary, choices, _concat, _clips = client.predict(api_name="/on_videos_tick")
     values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
     assert "clip:v_p4_child" in values
     assert "concat:v_p4_child" in values
@@ -1113,7 +1116,7 @@ def test_history_tab_lists_all_statuses(p4_app):
 def test_history_tab_shows_columns_required_by_design(p4_app):
     """設計書 §5.5 の列（状態・日時・ID・親ID・長さ・step・seed・backend・時間・分類）。"""
     client, _service, _cfg = p4_app
-    listing = client.predict("すべて", api_name="/on_history_tick")[0]
+    listing = client.predict("すべて", api_name="/on_history_tick")
 
     for header in ("状態", "日時", "ID", "親ID", "長さ", "step", "seed指定", "seed実際",
                    "backend・model", "処理時間", "実行方式", "エラー"):
@@ -1131,44 +1134,60 @@ def test_history_filter_narrows_rows(p4_app):
     """状態フィルタで表示が絞られる（すべて／成功／失敗）。"""
     client, _service, _cfg = p4_app
 
-    success = client.predict("成功", api_name="/on_history_filter")[0]
+    success = client.predict("成功", api_name="/on_history_filter")
     assert "v_p4_root" in success
     assert "v_p4_failed" not in success
     assert "v_p4_queued" not in success
 
-    failed = client.predict("失敗", api_name="/on_history_filter")[0]
+    failed = client.predict("失敗", api_name="/on_history_filter")
     assert "v_p4_failed" in failed
     assert "v_p4_root" not in failed
     assert "メモリ不足（OOM）" in failed
 
-    everything = client.predict("すべて", api_name="/on_history_filter")[0]
+    everything = client.predict("すべて", api_name="/on_history_filter")
     assert "v_p4_failed" in everything and "v_p4_root" in everything
 
 
-def test_history_detail_and_preview(p4_app):
-    """成功記録は詳細＋プレビュー、失敗記録は詳細のみ（プレビューは None）。"""
+def test_record_detail_and_preview_live_in_the_completed_tab(p4_app):
+    """詳細とプレビューは③「完成・編集」で見る（P7 で④から移した）。
+
+    ④は表だけの閲覧専用になったので、記録を選んで詳細を出す経路は③だけになった。
+    """
     client, _service, _cfg = p4_app
 
-    video, detail, tech = client.predict(
-        "clip:v_p4_child", "すべて", api_name="/on_select_history"
-    )
+    video, detail, tech = client.predict("clip:v_p4_child", api_name="/on_select_video")
     assert _video_path(video) is not None
-    assert "状態: **完成**" in detail
     assert "v_p4_root" in detail                 # 親ID
     assert "処理時間: 06:52" in detail
     # 内部の言い方（execution_engine）は「詳しい情報」だけに出す（P5 §6.4）
     assert "execution_engine" not in detail
     assert "execution_engine" in tech
 
-    video, detail, tech = client.predict(
-        "clip:v_p4_failed", "すべて", api_name="/on_select_history"
-    )
-    assert _video_path(video) is None
-    assert "状態: **失敗**" in detail
-    assert "メモリ不足（OOM）" in detail          # エラー分類は主要部に残す
-    assert "MPS backend out of memory" not in detail  # 例外文はそのまま出さない
-    assert "MPS backend out of memory" in tech
-    assert "v_p4_failed" in tech
+
+def test_failed_records_are_readable_in_the_history_table(p4_app):
+    """失敗の状態とエラー分類は④の**表**で分かる（P7）。
+
+    ④から詳細表示を無くしたので、失敗の理由は表の列で読めることが要件になる。
+    """
+    client, _service, _cfg = p4_app
+    table = client.predict("失敗", api_name="/on_history_filter")
+
+    assert "v_p4_failed" in table
+    assert "失敗" in table
+    assert "メモリ不足（OOM）" in table          # エラー分類が表から読める
+
+
+def test_the_history_selection_api_is_gone(p4_app):
+    """④の記録選択APIは廃止した（P7・意図的な契約変更）。"""
+    client, _service, _cfg = p4_app
+    for api_name in (
+        "/on_select_history",
+        "/on_history_concat",
+        "/on_history_reveal",
+        "/on_history_continuation",
+    ):
+        with pytest.raises(Exception):
+            client.predict("clip:v_p4_child", api_name=api_name)
 
 
 def test_history_tick_recovers_after_exception(p4_app, monkeypatch):
@@ -1182,11 +1201,11 @@ def test_history_tick_recovers_after_exception(p4_app, monkeypatch):
     if hasattr(service, "history_rows"):
         monkeypatch.setattr(service, "history_rows", boom)
     broken = client.predict("すべて", api_name="/on_history_tick")
-    assert "一覧を取得できません" in broken[0]
+    assert "一覧を取得できません" in broken
 
     monkeypatch.undo()
     recovered = client.predict("すべて", api_name="/on_history_tick")
-    assert "v_p4_root" in recovered[0]
+    assert "v_p4_root" in recovered
 
 
 def test_history_json_and_logs_are_not_served(p4_app):
@@ -1253,11 +1272,11 @@ def test_continuation_banner_and_prefill(p4_app):
     assert "継続モード" in out["message"]
 
 
-def test_continuation_can_be_started_from_history_tab(p4_app):
-    """④履歴タブからも同じ継続モードに入れる。"""
+def test_continuation_is_started_only_from_the_completed_tab(p4_app):
+    """継続生成の入口は③だけ（P7 で④の［続きを作る］を廃止した）。"""
     client, _service, _cfg = p4_app
     out = _continuation_outputs(
-        client.predict("clip:v_p4_child", api_name="/on_history_continuation")
+        client.predict("clip:v_p4_child", api_name="/on_start_continuation")
     )
     assert out["parent"] == "v_p4_child"
     assert "続きを作成中" in out["banner"]
@@ -1475,8 +1494,8 @@ def test_concat_status_states_are_japanese(p4_app, monkeypatch):
     assert "利用できません" in client.predict(api_name="/on_videos_tick")[2]
 
 
-def test_history_tab_concat_button(p4_app, monkeypatch):
-    """④履歴タブからも連結を開始できる。"""
+def test_concat_is_started_only_from_the_completed_tab(p4_app, monkeypatch):
+    """ルート連結の入口は③だけ（P7 で④の［ルートからここまでを連結］を廃止）。"""
     client, service, _cfg = p4_app
     seen: list[str] = []
     monkeypatch.setattr(
@@ -1484,7 +1503,7 @@ def test_history_tab_concat_button(p4_app, monkeypatch):
         "start_concat",
         lambda job_id: (seen.append(job_id), f"concat-9-{job_id}")[1],
     )
-    message = client.predict("clip:v_p4_child", api_name="/on_history_concat")
+    message, _status = client.predict("clip:v_p4_child", api_name="/on_start_concat")
     assert seen == ["v_p4_child"]
     assert "連結を開始しました" in message
 
@@ -1516,9 +1535,10 @@ def test_reveal_in_finder_calls_service_without_subprocess(p4_app, monkeypatch):
     assert seen == ["v_p4_root.mp4"]  # 解決済みの正式成果物パスが渡る
 
     # 連結行は job_id だけでは個別動画と区別できないため、
-    # UI がサーバ側で解決した連結成果物のパスを渡す（data_root 配下・実在）
-    from_history = client.predict("concat:v_p4_child", api_name="/on_history_reveal")
-    assert "Finder" in from_history
+    # UI がサーバ側で解決した連結成果物のパスを渡す（data_root 配下・実在）。
+    # P7 で Finder 表示の入口は③だけになった（④の分は廃止）
+    concat_message = client.predict("concat:v_p4_child", api_name="/on_reveal_video")
+    assert "Finder" in concat_message
     assert len(seen) == 2 and seen[0] == "v_p4_root.mp4"
     assert seen[1] == "c_v_p4_child_2clips.mp4"  # 連結行では連結ファイルが開く
 
@@ -1756,14 +1776,14 @@ def test_custom_concat_appears_in_the_completed_list(p4_app):
     assert "見つかりません" not in reveal
 
     # ④履歴タブの「連結成果物」フィルタから表で確認できる
-    table, hist_choices = client.predict("連結成果物", api_name="/on_history_filter")
+    table = client.predict("連結成果物", api_name="/on_history_filter")
     assert concat_id in table
     assert "指定順連結" in table
     assert "v_p4_child → v_p4_root" in table  # sources の順番が分かる
-    hist_values = [
-        c[1] if isinstance(c, (list, tuple)) else c for c in hist_choices["choices"]
-    ]
-    assert f"concat:{concat_id}" in hist_values
+    # 選ぶのは③（P7 で④から記録選択を無くした）
+    _summary, choices, _concat, _clips = client.predict(api_name="/on_videos_tick")
+    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
+    assert f"concat:{concat_id}" in values
 
 
 def test_custom_concat_candidates_exclude_concat_products(p4_app):
@@ -1831,11 +1851,11 @@ def test_history_existing_filters_are_not_regressed(p4_app):
         ("成功", "v_p4_root"),
         ("失敗", "v_p4_failed"),
     ):
-        table, _choices = client.predict(label, api_name="/on_history_filter")
+        table = client.predict(label, api_name="/on_history_filter")
         assert f"履歴（{label}" in table
         assert expect_id in table
     # 状態で絞ったときに連結成果物が混ざらない
-    success_table, _ = client.predict("成功", api_name="/on_history_filter")
+    success_table = client.predict("成功", api_name="/on_history_filter")
     assert "| 状態 | 種別 | 日時 | ID |" in success_table  # 従来の列構成
     assert "指定順連結" not in success_table
 
@@ -1847,7 +1867,7 @@ def test_history_concat_products_filter_lists_both_kinds(p4_app):
     status = _wait_concat(service)
     assert status.state == "done", status.message
 
-    table, choices = client.predict("連結成果物", api_name="/on_history_filter")
+    table = client.predict("連結成果物", api_name="/on_history_filter")
     assert "履歴（連結成果物" in table
     # 連結成果物向けの列（step / seed / 状態は出さない）
     assert "| 種類 | ID | 作成日時 | 長さ | 本数 | 元の動画（順番どおり） | ファイル |" in table
@@ -1857,11 +1877,8 @@ def test_history_concat_products_filter_lists_both_kinds(p4_app):
     assert status.concat_id in table and "v_p4_child" in table
     # 新しい順（いま作った指定順連結が先頭側）
     assert table.index(status.concat_id) < table.index("チェーン連結")
-    # 個別動画は出ない
+    # 個別動画は出ない（P7: ④に選択欄が無いので、絞り込みの確認は表だけで行う）
     assert "| 個別 |" not in table
-
-    values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
-    assert all(v.startswith("concat:") for v in values), values
 
 
 def test_history_concat_products_keep_source_order(p4_app):
@@ -1871,7 +1888,7 @@ def test_history_concat_products_keep_source_order(p4_app):
     status = _wait_concat(service)
     assert status.state == "done", status.message
 
-    table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+    table = client.predict("連結成果物", api_name="/on_history_filter")
     row = next(line for line in table.splitlines() if status.concat_id in line)
     assert "v_p4_child → v_p4_root" in row, row
     assert "v_p4_root → v_p4_child" not in row
@@ -1894,13 +1911,15 @@ def test_history_concat_products_hide_missing_files(p4_app, tmp_path):
     assert status.state == "done", status.message
     entries_before = len(service.concat_manifest.list_entries())
 
-    table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+    table = client.predict("連結成果物", api_name="/on_history_filter")
     assert status.concat_id in table  # まずは出ている
 
     # Finder で消した状況を再現する（記録だけが残る）
     status.output_path.rename(tmp_path / status.output_path.name)
-    table, choices = client.predict("連結成果物", api_name="/on_history_filter")
+    table = client.predict("連結成果物", api_name="/on_history_filter")
     assert status.concat_id not in table, "欠損した連結が④に残っています"
+    # ③の選択候補からも消える（P7 で④の選択欄は廃止したので③で確かめる）
+    _summary, choices, _concat, _clips = client.predict(api_name="/on_videos_tick")
     values = [c[1] if isinstance(c, (list, tuple)) else c for c in choices["choices"]]
     assert f"concat:{status.concat_id}" not in values
     assert "ファイル欠損" not in client.predict(api_name="/on_videos_tick")[0]
@@ -1909,25 +1928,31 @@ def test_history_concat_products_hide_missing_files(p4_app, tmp_path):
 
     # 正式パスへ戻すと、追加の操作なしで再表示される
     (tmp_path / status.output_path.name).rename(status.output_path)
-    table, _ = client.predict("連結成果物", api_name="/on_history_filter")
+    table = client.predict("連結成果物", api_name="/on_history_filter")
     assert status.concat_id in table
 
 
-def test_history_concat_product_preview_and_reveal(p4_app):
-    """④から連結成果物のプレビュー・Finder 表示ができる。"""
+def test_concat_product_preview_and_reveal_from_the_completed_tab(p4_app):
+    """連結成果物のプレビュー・Finder 表示は③から行う（P7）。
+
+    ④は表で確認するだけになったので、操作は③に一本化されている。
+    """
     client, service, _cfg = p4_app
     service.start_custom_concat(["v_p4_root", "v_p4_child"])
     status = _wait_concat(service)
     assert status.state == "done", status.message
 
     video, detail, _tech = client.predict(
-        f"concat:{status.concat_id}", "連結成果物", api_name="/on_select_history"
+        f"concat:{status.concat_id}", api_name="/on_select_video"
     )
     assert _video_path(video) is not None
     assert status.concat_id in detail and "連結元" in detail
 
-    reveal = client.predict(f"concat:{status.concat_id}", api_name="/on_history_reveal")
+    reveal = client.predict(f"concat:{status.concat_id}", api_name="/on_reveal_video")
     assert "見つかりません" not in reveal
+
+    # ④の表にも同じ成果物が出ている（見るだけならこちらで足りる）
+    assert status.concat_id in client.predict("連結成果物", api_name="/on_history_filter")
 
 
 def test_custom_concat_total_is_separate_from_the_list(p4_app):
@@ -2070,15 +2095,15 @@ def test_trash_removes_the_video_from_the_history_tab(p4_app):
     client, service, cfg = p4_app
     job_id = "v_p4_history_gone"
     _seed_extra_success(cfg, service.history, job_id)
-    table, _ = client.predict("成功", api_name="/on_history_filter")
+    table = client.predict("成功", api_name="/on_history_filter")
     assert job_id in table
 
     _result, message = _trash(client, f"clip:{job_id}", True)
     assert "ゴミ箱へ移動しました" in message
 
-    table, _ = client.predict("成功", api_name="/on_history_filter")
+    table = client.predict("成功", api_name="/on_history_filter")
     assert job_id not in table
-    table, _ = client.predict("すべて", api_name="/on_history_filter")
+    table = client.predict("すべて", api_name="/on_history_filter")
     assert job_id not in table
 
 

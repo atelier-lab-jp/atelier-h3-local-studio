@@ -133,6 +133,20 @@ class AppConfig:
         return self.data_root / "concat_manifest.json"
 
     @property
+    def upscaled_dir(self) -> Path:
+        """1080p高品質版の保存先（P6）。**HTTP 配信対象に入れる唯一の追加先**。"""
+        return self.data_root / "upscaled"
+
+    @property
+    def upscale_weights_path(self) -> Path:
+        """realesr-animevideov3 の重み（P6）。リポジトリには含めない。"""
+        return self.project_root / "app" / "assets" / "upscale" / "realesr-animevideov3.pth"
+
+    @property
+    def upscale_worker_script(self) -> Path:
+        return self.project_root / "app" / "postprocess" / "upscale_worker.py"
+
+    @property
     def trash_dir(self) -> Path:
         """アプリ内ゴミ箱（P5.3-B）。**HTTP 配信対象には入れない**。
 

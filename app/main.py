@@ -163,8 +163,13 @@ def main(argv: list[str] | None = None) -> int:
             "server_name": host,              # 通常は 127.0.0.1。LANモードだけ private IPv4
             "server_port": cfg.port,
             "share": False,                   # 外部公開しない（両モードで固定。設計書 §15）
-            # 配信は成果物ディレクトリのみに限定する（ログや履歴JSONは配信しない）
-            "allowed_paths": [str(cfg.outputs_dir), str(cfg.concat_dir)],
+            # 配信は成果物ディレクトリのみに限定する（ログや履歴JSONは配信しない）。
+            # 整理済みの動画を置くディレクトリは**絶対に加えない**（§26.11）。
+            "allowed_paths": [
+                str(cfg.outputs_dir),
+                str(cfg.concat_dir),
+                str(cfg.upscaled_dir),  # P6: 1080p高品質版
+            ],
             "inbrowser": cfg.auto_open_browser and not args.smoke and not args.lan,
         }
         if args.smoke:

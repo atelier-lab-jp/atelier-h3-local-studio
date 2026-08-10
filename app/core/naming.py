@@ -7,6 +7,7 @@ P5.2 で任意順序連結の成果物 ID `cm_YYYYMMDD_HHMMSS_xxxx` を追加し
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from datetime import datetime
@@ -46,3 +47,37 @@ def manual_concat_filename(concat_id: str, clips: int) -> str:
     if not isinstance(clips, int) or isinstance(clips, bool) or clips < 2:
         raise ValueError(f"連結本数は2以上の整数で指定してください: {clips!r}")
     return f"{concat_id}_{clips}clips.mp4"
+
+
+#: 1080p高品質版（P6）の元成果物の種類。**種類を省略しない**
+#: （個別動画とチェーン連結は同じ job_id を使うため、種類が無いと衝突する）。
+UPSCALE_SOURCE_KINDS = ("clip", "chain", "manual")
+
+#: ファイル名に使ってよい文字（安全な短縮の判定に使う）
+_SAFE_ID = re.compile(r"^[0-9A-Za-z_.-]{1,64}$")
+
+#: 出力名が長くなりすぎないための上限（短縮時はハッシュを足して一意にする）
+_MAX_ID_IN_NAME = 48
+
+
+def is_safe_artifact_id(value: str) -> bool:
+    """成果物IDとして安全か（パス区切り・`..`・制御文字・長すぎる値を弾く）。"""
+    text = str(value)
+    return bool(_SAFE_ID.match(text)) and ".." not in text
+
+
+def upscaled_filename(source_kind: str, source_id: str) -> str:
+    """`u_{種類}_{元ID}_1080p.mp4`（P6）。**同じ入力なら必ず同じ名前**になる。
+
+    長いIDは短縮したうえで短いハッシュを足す（別のIDが同じ名前にならないように）。
+    """
+    if source_kind not in UPSCALE_SOURCE_KINDS:
+        raise ValueError(f"高品質化できない種類です: {source_kind!r}")
+    if not is_safe_artifact_id(source_id):
+        raise ValueError(f"動画IDの形式が正しくありません: {source_id!r}")
+
+    safe_id = source_id
+    if len(safe_id) > _MAX_ID_IN_NAME:
+        digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:8]
+        safe_id = f"{source_id[: _MAX_ID_IN_NAME - 9]}_{digest}"
+    return f"u_{source_kind}_{safe_id}_1080p.mp4"

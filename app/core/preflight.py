@@ -11,6 +11,7 @@ P5 で iPhone接続モード（LANモード）のチェックを追加した。`
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import socket
 import subprocess
@@ -156,6 +157,51 @@ def check_worker_packages(cfg: AppConfig, timeout: int = 240) -> str | None:
     return None
 
 
+#: 1080p高品質化のモデル（P6）。公式配布物の SHA-256（Real-ESRGAN v0.2.5.0 リリース）。
+#: 一致しなければ**警告だけ**にする（使えなくはないが、想定と違う重みかもしれない）。
+UPSCALE_WEIGHTS_SHA256 = (
+    "b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d"
+)
+
+
+def check_upscale(cfg: AppConfig) -> PreflightResult:
+    """1080p高品質化（P6）を使える状態か調べる。
+
+    **この機能が無くてもアプリは起動する**ので、足りないものはすべて警告にする
+    （エラーにすると、高品質化を使わない人が起動できなくなってしまう）。
+    """
+    result = PreflightResult()
+
+    weights = cfg.upscale_weights_path
+    if not weights.is_file():
+        result.warnings.append(
+            "1080p高品質化のモデルがありません（この機能だけが使えません）。"
+            "`./scripts/setup.sh --with-upscale` で取得できます"
+            f"（配置先: {weights.relative_to(cfg.project_root)}）"
+        )
+        return result
+
+    try:
+        digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+    except OSError as e:  # pragma: no cover - 実行環境依存
+        result.warnings.append(f"1080p高品質化のモデルを読めません: {e}")
+        return result
+
+    size_mb = weights.stat().st_size / (1024 * 1024)
+    if digest != UPSCALE_WEIGHTS_SHA256:
+        result.warnings.append(
+            "1080p高品質化のモデルが想定と違います"
+            f"（SHA-256: {digest[:12]}… / 期待: {UPSCALE_WEIGHTS_SHA256[:12]}…）。"
+            "取得し直す場合は `./scripts/setup.sh --with-upscale` を実行してください"
+        )
+        return result
+
+    result.infos.append(
+        f"1080p高品質化: 利用できます（realesr-animevideov3 / {size_mb:.1f}MB / SHA-256一致）"
+    )
+    return result
+
+
 def run_preflight(
     cfg: AppConfig,
     mode: str,
@@ -175,7 +221,8 @@ def run_preflight(
 
     # データ領域の作成・書込可否
     try:
-        for d in (cfg.outputs_dir, cfg.concat_dir, cfg.tmp_dir, cfg.logs_dir):
+        for d in (cfg.outputs_dir, cfg.concat_dir, cfg.tmp_dir, cfg.logs_dir,
+                  cfg.upscaled_dir):
             d.mkdir(parents=True, exist_ok=True)
         probe = cfg.tmp_dir / ".write_check"
         probe.write_text("ok", encoding="utf-8")
@@ -235,6 +282,11 @@ def run_preflight(
         )
     else:
         result.infos.append(f"空き容量: {free_gb:.1f}GB（問題なし）")
+
+    # 1080p高品質化（P6）。使えなくてもアプリは起動するので、足りなければ警告だけ
+    upscale = check_upscale(cfg)
+    result.warnings.extend(upscale.warnings)
+    result.infos.extend(upscale.infos)
 
     # 孤児 partial の列挙（削除はしない。§10.7 手順6）
     orphans = list_orphan_partials(cfg.outputs_dir, cfg.concat_dir, cfg.tmp_dir)

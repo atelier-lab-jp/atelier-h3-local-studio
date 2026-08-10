@@ -51,8 +51,12 @@ API 互換（P1〜P3 の回帰防止）:
   `/on_cancel_queued` `/on_restart_worker` は引数・戻り値の数と順序を変えない。
   継続生成に対応した投入は **新しい `/on_submit_v2`** として追加し、
   `/on_submit`（5引数）は API 専用の非表示ボタンに残してある。
-- P5 で `/on_select_video` `/on_select_history` の戻り値は 2→**3**（プレビュー・
-  詳細・「詳しい情報」）へ増やした。上の7つの固定 API は変えていない。
+- P5 で `/on_select_video` の戻り値は 2→**3**（プレビュー・詳細・「詳しい情報」）へ
+  増やした。上の7つの固定 API は変えていない。
+- **P7 で ④「履歴」を閲覧専用にした（決定D22）**。動画への操作は③へ一本化し、
+  `/on_select_history` `/on_history_concat` `/on_history_reveal`
+  `/on_history_continuation` は**廃止**（意図的な契約変更）。
+  `/on_history_filter` `/on_history_tick` は残るが、戻り値は 2→**1**（履歴表だけ）。
 """
 
 from __future__ import annotations
@@ -213,10 +217,17 @@ _DISK_LABELS = {
 # ------------------------------------------------------------------ P4 定数
 
 #: 成果物の種別ラベル（③完成動画・④履歴の一覧で個別と連結を見分ける）
-KIND_LABELS = {"clip": "個別", "concat": "連結"}
+KIND_LABELS = {"clip": "個別", "concat": "連結", "upscaled": "1080p"}
 
 #: 連結成果物の作り方の別（P5.3-A）。④の「連結成果物」フィルタで区別して見せる。
 CONCAT_KIND_LABELS = {"chain": "チェーン連結", "manual": "指定順連結", None: "連結"}
+
+#: 1080p成果物が何から作られたか（P6）。ファイル名に埋まっている種類をそのまま訳す。
+UPSCALE_SOURCE_LABELS = {
+    "clip": "個別動画",
+    "chain": "チェーン連結",
+    "manual": "指定順連結",
+}
 
 #: ③タブの表示名（P5.3-A で「完成動画」から改称）。**内部IDは `tab_videos` のまま**。
 #: 一覧表を④へ移し、③は「選ぶ・見る・つなげる」作業画面になったため。
@@ -226,6 +237,10 @@ VIDEOS_TAB_LABEL = "完成・編集"
 #: 番兵にしてある（状態で絞る既存の経路へ紛れ込ませないため）。
 CONCAT_PRODUCTS_FILTER = "連結成果物"
 CONCAT_PRODUCTS_SENTINEL = "__concat_products__"
+
+#: 「1080p成果物」フィルタの内部値（P6）。上と同じく状態値とは重ならない番兵。
+UPSCALED_PRODUCTS_FILTER = "1080p成果物"
+UPSCALED_PRODUCTS_SENTINEL = "__upscaled_products__"
 
 #: ④履歴の状態フィルタ。`history_rows(status=...)` へ渡す値（すべて＝None）。
 #: QUEUED / RUNNING は正常終了後には残らないが、異常データを隠さないため選択肢に残す。
@@ -240,6 +255,7 @@ HISTORY_FILTERS: dict[str, str | None] = {
     "実行待ち": "queued",
     "実行中": "running",
     CONCAT_PRODUCTS_FILTER: CONCAT_PRODUCTS_SENTINEL,
+    UPSCALED_PRODUCTS_FILTER: UPSCALED_PRODUCTS_SENTINEL,
 }
 
 #: 連結の進行状態（`concat_service.ConcatStatus.state`）→ 日本語。
@@ -288,6 +304,23 @@ CUSTOM_CONCAT_LABEL = "▶ この順番で連結（2本以上選んでくださ�
 #: ここはあくまで画面に出す文字列で、実際のパスは `cfg.trash_dir` から解決する。
 TRASH_DIR_LABEL = "trash"
 TRASH_BUTTON_LABEL = "🗑 ゴミ箱へ移動"
+
+#: 1080p高品質化（P6）。**元の動画は書き換えず、別ファイルとして増える**。
+UPSCALE_TITLE = "この動画を1080pにする"
+UPSCALE_BUTTON_LABEL = "✨ 1080pに高品質化する"
+UPSCALE_CANCEL_LABEL = "■ 高品質化を中止"
+UPSCALE_NOTE = (
+    "AI が細部を描き足して **1920×1080** の別ファイルを作ります"
+    "（保存先は `data/upscaled/`）。**元の動画はそのまま残ります。**"
+    "音声はそのまま引き継ぎ、上下左右は引き伸ばさず左右を均等に切り取ります。"
+    "時間の目安は 124フレームで **約15秒**です。"
+    "実行中は動画の生成・連結・整理をお待ちいただきます。"
+)
+#: 1080p成果物そのものを選んでいるときの案内（さらに高品質化はできない）
+UPSCALE_ALREADY_NOTE = (
+    "これは1080pの高品質版です。**これ以上の高品質化はできません。**"
+    "プレビュー・Finder表示・整理はそのまま使えます。"
+)
 
 CUSTOM_ADD_LABEL = "＋ 連結候補へ追加"
 CUSTOM_UP_LABEL = "↑ 1つ上へ"
@@ -369,7 +402,6 @@ VIDEOS_EMPTY_NOTE = (
     "上の選択欄から動画を選び、［選んだ動画を表示］を押すと、"
     "ここに詳細とプレビューが出ます。"
 )
-HISTORY_EMPTY_NOTE = "上の一覧から記録を選ぶと、ここに詳細が出ます。"
 
 # ------------------------------------------------------------------ P5 定数（§6.1）
 
@@ -387,6 +419,21 @@ MOBILE_CSS = f"""
 /* ---- 共通（Mac・iPhone の両方に効く。既存レイアウトは変えない） ---- */
 .h3-scroll {{ overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }}
 .h3-scroll table {{ margin: 0; }}
+/* ---- 履歴表をページ幅いっぱいに使う（P7） ----
+   ④から右カラムを無くしたぶん、表を広く読みやすくする。**器の幅を使い切る**
+   だけの指定なので、`.gradio-container` 側の幅や中央寄せには触っていない。
+   `table-layout` は既定（auto）のまま＝内容に応じて列幅が決まる。 */
+.h3-wide {{ width: 100%; }}
+.h3-wide table {{ width: 100%; }}
+/* 日時・ID・seed などが途中で折り返して行が高くなるのを防ぐ。
+   横に長い表は `.h3-scroll` の**内側だけ**で横スクロールできる。 */
+.h3-wide table th, .h3-wide table td {{ white-space: nowrap; }}
+/* ただし最後の列（ジョブ履歴では「エラー」）だけは折り返す。
+   ここは長文になりうるので、nowrap のままだと表全体が何倍にも広がり、
+   Mac でも常に横スクロールしないと他の列が読めなくなる。 */
+.h3-wide table th:last-child, .h3-wide table td:last-child {{
+  white-space: normal; max-width: 26em;
+}}
 /* 連結候補の一覧だけを縦スクロールにする（P5.3-A）。20本選んでもページ全体は
    伸びず、2〜5本のときは中身の高さのままなので余分な空白も出ない。
    横は広げない（`overflow-x` を触らないので横スクロールは発生しない）。 */
@@ -1024,6 +1071,11 @@ def build_ui(
     _has_concat_candidates = hasattr(service, "concat_candidates")
     # P5.3-B: アプリ内ゴミ箱（未対応のサービスでも③は従来どおり使える）
     _has_trash = hasattr(service, "move_to_trash")
+    # P6: 1080p高品質化（未対応のサービスでも③は従来どおり使える）
+    _has_upscale = hasattr(service, "start_upscale") and hasattr(
+        service, "upscale_status"
+    )
+    _has_upscaled_rows = hasattr(service, "upscaled_rows")
 
     def _submit_accepts_continuation() -> bool:
         """`submit_generation` が parent_id / keyframe_path を受けるか調べる。"""
@@ -1038,12 +1090,17 @@ def build_ui(
     def _servable(path, *, allow_tmp: bool = False) -> Path | None:
         """ブラウザへ渡してよいパスだけを通す（設計書 §15）。
 
-        `data/outputs` と `data/concat` の成果物のみ。履歴JSON・ログ・data_root 外は
-        たとえ履歴に書かれていても配信しない。実在しないものは None にする。
+        `data/outputs`・`data/concat`・`data/upscaled` の成果物のみ。
+        履歴JSON・ログ・`data/trash`・data_root 外は、たとえ履歴に書かれていても
+        配信しない。実在しないものは None にする。
+
+        **`app/main.py` の `allowed_paths` と同じ並びにしておくこと**（片方だけ
+        増やすと、画面には出るのに再生できない動画ができてしまう。P6 で実際に
+        `data/upscaled` を足し忘れて起きた）。
         """
         if path is None or path == "":
             return None
-        bases = [cfg.outputs_dir, cfg.concat_dir]
+        bases = [cfg.outputs_dir, cfg.concat_dir, cfg.upscaled_dir]
         if allow_tmp:
             bases.append(cfg.tmp_dir)
         try:
@@ -1055,11 +1112,30 @@ def build_ui(
             return None
         return None
 
+    def _upscaled_rows() -> list:
+        """1080p高品質版の行（P6）。**台帳ではなく実在するファイルから作られる**。"""
+        if not _has_upscaled_rows:
+            return []
+        try:
+            return list(service.upscaled_rows())
+        except Exception:  # 設計書 §13.2
+            log.exception("1080p成果物の一覧を取得できませんでした")
+            return []
+
     def _completed_rows() -> list:
-        """③完成動画タブの一覧（成功した個別動画 ＋ 連結動画。新しい順）。"""
+        """③完成・編集タブの一覧（個別 ＋ 連結 ＋ 1080p高品質版。新しい順）。
+
+        P6 で 1080p 成果物を加えた。プレビュー・Finder表示・整理の対象に
+        したいので**同じ一覧に混ぜる**が、種別（`upscaled`）で区別できるので
+        「続きを作る」「連結」といった操作は選択時に閉じられる。
+
+        完成動画の取得に失敗したときは**ここで握りつぶさない**（呼び出し側が
+        「取得できません」と出す。0件と取り違えさせないため。設計書 §13.2）。
+        1080p の一覧だけは失敗しても空で続ける（本体の表示を巻き添えにしない）。
+        """
         if not _has_completed_videos:
             return []
-        return _sorted_newest_first(list(service.completed_videos()))
+        return _sorted_newest_first(list(service.completed_videos()) + _upscaled_rows())
 
     def _concat_row_of(row):
         """個別行に対応する連結成果物の行（無ければ None）。
@@ -1105,6 +1181,8 @@ def build_ui(
         """
         if status == CONCAT_PRODUCTS_SENTINEL:
             return _concat_product_rows()
+        if status == UPSCALED_PRODUCTS_SENTINEL:
+            return _sorted_newest_first(_upscaled_rows())
         if not _has_history_rows:
             return []
         rows: list = []
@@ -1146,12 +1224,15 @@ def build_ui(
         clips = sum(1 for r in rows if _attr(r, "kind", "clip") == "clip")
         chains = sum(1 for r in rows if getattr(r, "concat_kind", None) == "chain")
         manuals = sum(1 for r in rows if getattr(r, "concat_kind", None) == "manual")
+        upscaled = sum(1 for r in rows if _attr(r, "kind", "clip") == "upscaled")
 
         parts = [f"個別{clips}件"]
         if chains:
             parts.append(f"チェーン連結{chains}件")
         if manuals:
             parts.append(f"指定順連結{manuals}件")
+        if upscaled:
+            parts.append(f"1080p{upscaled}件")
         return (
             f"**完成した動画: {len(rows)}件**（{'・'.join(parts)}）\n\n"
             "一覧は「履歴」タブで見られます。"
@@ -1198,19 +1279,22 @@ def build_ui(
             )
         return "\n".join(lines)
 
-    def _row_detail(row, *, with_status: bool) -> str:
-        """選択行の詳細（③④共通の**主要部**）。
+    def _row_detail(row) -> str:
+        """選択行の詳細（③「完成・編集」の**主要部**）。
 
         backend / model / execution_engine などの内部の言い方は
         `_row_tech_detail()`（「詳しい情報」）へ分けている（P5 §6.4）。
         **ジョブIDとエラーの種類はここに残す**（調査できなくなるため）。
+
+        P7 で ④からこの詳細表示を無くしたので、状態（成功／失敗など）と
+        「指定した seed」を添える分岐は削除した。③に並ぶのは**成功して
+        ファイルが在る動画だけ**なので、状態を書いても常に「完成」にしかならない。
+        失敗・取消・中断の状態は④の表で見る。
         """
         kind = _attr(row, "kind", "clip")
         lines = [
             f"### {KIND_LABELS.get(kind, kind)}動画 `{_attr(row, 'job_id', '')}`",
         ]
-        if with_status:
-            lines.append(f"状態: **{_status_label(row)}**")
         lines.append(
             f"作成日時: {_fmt_dt(getattr(row, 'created_at', None))} ／ "
             f"長さ: {_attr(row, 'duration_label', '—')}"
@@ -1221,15 +1305,7 @@ def build_ui(
             )
             + f" ／ ステップ: {_attr(row, 'steps', '—')}"
         )
-        seed_requested = getattr(row, "seed_requested", None)
-        lines.append(
-            f"seed: {_seed_cell(row)}"
-            + (
-                ""
-                if not with_status
-                else f"（指定: {seed_requested if seed_requested is not None else 'ランダム'}）"
-            )
-        )
+        lines.append(f"seed: {_seed_cell(row)}")
         lines.append(
             f"親ID: {getattr(row, 'parent_id', None) or 'なし（ルート）'} ／ "
             f"チェーン長: {_attr(row, 'chain_length', '—')}"
@@ -1364,17 +1440,20 @@ def build_ui(
             clip_choices = gr.update()
         return listing, choices, concat, clip_choices
 
-    def _history_view(filter_label) -> tuple:
-        """④タブの Timer 表示。スナップショットは1 tick に**1回だけ**取得する。"""
+    def _history_view(filter_label) -> str:
+        """④タブの表示（P7 で**表そのもの1つだけ**になった）。
+
+        以前は選択候補（Dropdown の choices）も一緒に返していたが、
+        ④から記録選択を無くしたので返す必要がなくなった。
+        """
         try:
             status = HISTORY_FILTERS.get(filter_label)
-            rows = _history_rows(status)
-            return (_history_table(rows, filter_label), _select_choices(rows))
-        except Exception:  # 設計書 §13.2
+            return _history_table(_history_rows(status), filter_label)
+        except Exception:  # 設計書 §13.2: UI の更新を永久に止めない
             log.exception("履歴の一覧を取得できませんでした")
             return (
-                "### 履歴\n⚠️ 一覧を取得できません（「詳しい情報（アプリの動作ログ）」をご確認ください）",
-                gr.update(),
+                "### 履歴\n⚠️ 一覧を取得できません"
+                "（「①新規生成」タブの「詳しい情報（アプリの動作ログ）」をご確認ください）"
             )
 
     def _history_table(rows: list, filter_label) -> str:
@@ -1382,6 +1461,9 @@ def build_ui(
         if label == CONCAT_PRODUCTS_FILTER:
             # 連結成果物には step / seed / 状態遷移が無いので、専用の列で出す
             return _concat_products_table(rows)
+        if label == UPSCALED_PRODUCTS_FILTER:
+            # 1080p成果物も同じ理由で専用の列にする（P6）
+            return _upscaled_products_table(rows)
         if not _has_history_rows:
             return f"### 履歴\n{_UNSUPPORTED}"
         if not rows:
@@ -1434,13 +1516,41 @@ def build_ui(
             )
         return "\n".join(lines)
 
-    def _preview_of(
-        rows: list, key: str, *, with_status: bool, empty_message: str
-    ) -> tuple:
+    def _upscaled_products_table(rows: list) -> str:
+        """④履歴タブの「1080p成果物」フィルタ用の表（P6）。
+
+        1080p成果物はジョブではないので、step / seed / 状態遷移の列は持たない。
+        **元の動画がどれか**が分かることが大事なので、その列を持つ。
+        元の動画をあとから整理していても、この一覧からは消えない。
+        """
+        if not rows:
+            return (
+                "### 履歴（1080p成果物・0件）\n"
+                "まだ1080pの高品質版はありません。"
+                "「完成・編集」タブで動画を選んで作れます。"
+            )
+        lines = [
+            f"### 履歴（1080p成果物・{len(rows)}件・新しい順）",
+            "",
+            "| 元の種類 | 元のID | 作成日時 | 長さ | 解像度 | ファイル |",
+            "|---|---|---|---:|---|---|",
+        ]
+        for row in rows:
+            source_kind = getattr(row, "upscale_source_kind", None)
+            lines.append(
+                f"| {UPSCALE_SOURCE_LABELS.get(source_kind, '—')} "
+                f"| `{_cell(getattr(row, 'upscale_source_id', None) or '—')}` "
+                f"| {_cell(_fmt_dt(getattr(row, 'created_at', None)))} "
+                f"| {_cell(_attr(row, 'duration_label', '—'))} "
+                f"| 1920×1080 "
+                f"| `{_cell(_attr(row, 'job_id', ''))}.mp4` |"
+            )
+        return "\n".join(lines)
+
+    def _preview_of(rows: list, key: str, *, empty_message: str) -> tuple:
         """選択キーから（動画パス・詳細・「詳しい情報」）の3つを作る（P5 §6.4）。
 
-        未選択のときの案内文は③と④で異なる（選択欄の位置もボタン名も違う）ため、
-        呼び出し側から `empty_message` を受け取る。
+        P7 以降の呼び出し元は③「完成・編集」だけ（④は閲覧専用になった）。
         """
         if not key:
             return (
@@ -1455,7 +1565,7 @@ def build_ui(
                 f"⚠️ 選択された記録が見つかりません: `{key}`",
                 f"- 選択キー: `{key}`（一覧に該当なし）",
             )
-        detail = _row_detail(row, with_status=with_status)
+        detail = _row_detail(row)
         tech = _row_tech_detail(row)
         if not _attr(row, "exists", False):
             return None, detail, tech
@@ -1702,7 +1812,6 @@ def build_ui(
             return _preview_of(
                 _completed_rows(),
                 str(key or "").strip(),
-                with_status=False,
                 empty_message=VIDEOS_EMPTY_NOTE,
             )
         except Exception:  # 設計書 §13.2
@@ -1724,6 +1833,11 @@ def build_ui(
         _kind, job_id = _split_key(key)
         if not job_id:
             return "⚠️ 連結する動画を一覧から選んでください。"
+        if _kind == "upscaled":
+            return (
+                "⚠️ 1080pの高品質版は連結できません"
+                "（連結できるのは生成した動画だけです）。"
+            )
         if not _has_concat:
             return _UNSUPPORTED
         previous_key = _concat_key()
@@ -1871,6 +1985,126 @@ def build_ui(
             gr.update(value=False),                      # 確認チェックを戻す
             message,
         )
+
+    # --------------------------------------- ③1080p高品質化（P6・設計書 §26）
+    #
+    # 送るのは選択キー（`種別:ID`）だけで、元動画の場所も出力先も
+    # AppService が決める（ブラウザから来たパスは一切使わない）。
+    # 進捗は専用の Timer（`on_upscale_tick`）で更新する。**プレーヤーと
+    # 選択欄はその outputs に入れない**ので、実行中に再生や選択が壊れない。
+
+    def _upscale_status_text() -> str:
+        """高品質化の進行状態。`52 / 124フレーム（42%）` の形で出す。"""
+        if not _has_upscale:
+            return f"### 1080pの状態\n{_UNSUPPORTED}"
+        try:
+            status = service.upscale_status()
+        except Exception:  # 設計書 §13.2
+            log.exception("高品質化の状態を取得できませんでした")
+            return "### 1080pの状態\n⚠️ 状態を取得できません（アプリの動作ログをご確認ください）"
+        if status is None:
+            return "### 1080pの状態\n⚠️ 高品質化の機能を利用できません。"
+
+        label = getattr(status, "state_label", None) or "待機中"
+        state = str(getattr(status, "state", "") or "idle").lower()
+        mark = {"succeeded": " ✅", "failed": " ❌", "cancelled": " ■"}.get(state, "")
+        lines = [f"### 1080pの状態\n**{label}{mark}**"]
+
+        frame = int(getattr(status, "frame", 0) or 0)
+        total = int(getattr(status, "total", 0) or 0)
+        if getattr(status, "running", False) and total:
+            percent = getattr(status, "percent", 0)
+            lines.append(f"{frame} / {total}フレーム（{percent}%）")
+        source_label = getattr(status, "source_label", "")
+        if source_label and getattr(status, "running", False):
+            lines.append(f"対象: {source_label}")
+        message = getattr(status, "message", None)
+        if message:
+            lines.append(str(message))
+        output_path = getattr(status, "output_path", None)
+        if output_path and state == "succeeded":
+            lines.append(f"出力: `{Path(output_path).name}`")
+        return "\n\n".join(lines)
+
+    def _upscale_controls(key) -> tuple:
+        """選択に応じて高品質化セクションの出し入れを決める（3値）。
+
+        - 実在する個別・連結動画 → 実行できる
+        - 1080p成果物そのもの → セクションは出すが**ボタンは出さない**
+          （「これ以上の高品質化はできない」ことを画面で説明する）
+        - 何も選んでいない／記録だけの動画 → 隠す
+        """
+        hidden = (gr.update(visible=False), gr.update(visible=False), gr.update())
+        if not _has_upscale:
+            return hidden
+        row = _find_row(_completed_rows(), str(key or "").strip())
+        if row is None or not _attr(row, "exists", False):
+            return hidden
+        if _attr(row, "kind", "clip") == "upscaled":
+            return (
+                gr.update(visible=True),
+                gr.update(visible=False),
+                gr.update(value=UPSCALE_ALREADY_NOTE),
+            )
+        return (
+            gr.update(visible=True),
+            gr.update(visible=True, value=UPSCALE_BUTTON_LABEL),
+            gr.update(value=UPSCALE_NOTE),
+        )
+
+    def on_selection_changed_for_upscale(key):
+        try:
+            return _upscale_controls(key)
+        except Exception:  # 設計書 §13.2
+            log.exception("高品質化セクションの表示を更新できませんでした")
+            return gr.update(visible=False), gr.update(visible=False), gr.update()
+
+    def on_upscale_tick():
+        """高品質化の進行だけを更新する専用 Timer（2値）。
+
+        `on_videos_tick`（4値）とは分けてある。既存の api_name の戻り値の数を
+        変えないための分離で、②キュータブと同じやり方（設計書 §24.4）。
+
+        2つ目は**中止ボタンを包む Group** の表示可否。ボタンそのものは
+        Timer から一切触らない（毎秒の更新と押下が競合しないように）。
+        """
+        try:
+            text = _upscale_status_text()
+        except Exception:  # 設計書 §13.2
+            log.exception("高品質化の状態表示を作れませんでした")
+            text = "### 1080pの状態\n⚠️ 状態を取得できません（アプリの動作ログをご確認ください）"
+        running = False
+        try:
+            status = service.upscale_status() if _has_upscale else None
+            running = bool(status is not None and getattr(status, "running", False))
+        except Exception:  # 設計書 §13.2
+            log.exception("高品質化の実行状態を取得できませんでした")
+        return text, gr.update(visible=running)
+
+    def on_start_upscale(key):
+        """［1080pに高品質化する］。開始はバックグラウンドで、ここでは待たない。"""
+        kind, job_id = _split_key(key)
+        if not _has_upscale:
+            return _UNSUPPORTED, gr.update()
+        if not job_id:
+            return "⚠️ 高品質化する動画を選んでください。", gr.update()
+        try:
+            ok, message = service.start_upscale(job_id, kind)
+        except Exception:  # 設計書 §13.2
+            log.exception("高品質化を開始できませんでした: %s", key)
+            return f"❌ 高品質化を開始できませんでした{_LOG_HINT}", gr.update()
+        return (f"✅ {message}" if ok else f"⚠️ {message}"), _upscale_status_text()
+
+    def on_cancel_upscale():
+        """［高品質化を中止］。途中のファイルは残さない（正式名は作られない）。"""
+        if not _has_upscale:
+            return _UNSUPPORTED, gr.update()
+        try:
+            message = service.cancel_upscale()
+        except Exception:  # 設計書 §13.2
+            log.exception("高品質化を中止できませんでした")
+            return f"❌ 中止できませんでした{_LOG_HINT}", gr.update()
+        return str(message), _upscale_status_text()
 
     # ------------------------------------------- ③指定順連結（P5.2・設計書 §23）
     #
@@ -2127,6 +2361,11 @@ def build_ui(
                 "⚠️ 連結動画の続きは作れません"
                 "（続きを作れるのは個別の生成動画だけです）。"
             )
+        if _kind == "upscaled":
+            return _no_continuation_update(
+                "⚠️ 1080pの高品質版から続きは作れません"
+                "（続きを作れるのは個別の生成動画だけです）。"
+            )
         if not _has_continuation:
             return _no_continuation_update(_UNSUPPORTED)
         try:
@@ -2164,10 +2403,6 @@ def build_ui(
         """③完成動画タブの［この動画の続きを作る］。"""
         return _start_continuation(key)
 
-    def on_history_continuation(key):
-        """④履歴タブの［この動画の続きを作る］（③と同じ処理）。"""
-        return _start_continuation(key)
-
     def on_clear_continuation():
         """［継続モードを解除］。バナーを消し、親ID（＝keyframe）を外す。"""
         return (
@@ -2179,38 +2414,18 @@ def build_ui(
             "（プロンプトとシードはそのまま残しています）。",
         )
 
-    # ------------------------------------------- ④履歴タブの callbacks（P4）
+    # ------------------------- ④履歴タブの callbacks（P4 → P7 で閲覧専用）
+    #
+    # 残っているのは**表を作り直す2つだけ**。記録の選択・プレビュー・Finder表示・
+    # 続きを作る・ルート連結はすべて③へ一本化したので、④側の入口は削除した。
 
     def on_history_tick(filter_label):
-        """④タブ用の Timer。**プレーヤーには触れない**。"""
+        """④タブ用の Timer。フィルタに対応する表だけを返す（1値）。"""
         return _history_view(filter_label)
 
     def on_history_filter(filter_label):
+        """状態フィルタが変わったとき。返すのは表だけ（1値）。"""
         return _history_view(filter_label)
-
-    def on_select_history(key, filter_label):
-        """選択された履歴レコードの詳細（3値。成功動画のみプレビューを出す）。"""
-        try:
-            rows = _history_rows(HISTORY_FILTERS.get(filter_label))
-            return _preview_of(
-                rows,
-                str(key or "").strip(),
-                with_status=True,
-                empty_message=HISTORY_EMPTY_NOTE,
-            )
-        except Exception:  # 設計書 §13.2
-            log.exception("履歴の詳細を取得できませんでした")
-            return (
-                None,
-                "⚠️ 記録を読み込めませんでした（下の「詳しい情報」とアプリの動作ログをご確認ください）。",
-                "- 履歴の詳細取得でエラーが発生しました（アプリの動作ログを参照）",
-            )
-
-    def on_history_concat(key):
-        return _concat_message(key)
-
-    def on_history_reveal(key):
-        return _reveal_message(key)
 
     # ---------------------------------------------------------------- layout
 
@@ -2442,9 +2657,37 @@ def build_ui(
                             )
                             video_concat_btn = gr.Button("ルートからここまでを連結")
                             video_reveal_btn = gr.Button("Finderで表示（Macのみ）")
-                        # ここが将来 [1080p高品質化] を足す場所（P6）。今は何も置かない
                         videos_msg_md = gr.Markdown("")
                         gr.Markdown(FINDER_NOTE, elem_classes=["h3-note"])
+
+                        # ---- P6: 1080p高品質化。整理セクションと同じく
+                        # **実在する動画を選んだときだけ**現れる。1080p成果物を
+                        # 選んだ場合はセクションだけ出して、ボタンは出さない。
+                        with gr.Group(
+                            visible=False, elem_classes=["h3-panel"]
+                        ) as upscale_group:
+                            gr.Markdown(f"### {UPSCALE_TITLE}")
+                            upscale_note_md = gr.Markdown(
+                                UPSCALE_NOTE, elem_classes=["h3-note"]
+                            )
+                            with gr.Row(elem_classes=["h3-row", "h3-tap"]):
+                                upscale_btn = gr.Button(
+                                    UPSCALE_BUTTON_LABEL,
+                                    variant="primary",
+                                    visible=False,
+                                    elem_classes=["h3-tap"],
+                                )
+                                # 中止ボタンは実行中だけ出したいが、**Timer から
+                                # ボタンそのものを更新しない**（毎秒の更新と
+                                # 押下時の状態変化が競合するため。§24.4）。
+                                # 包んだ Group の visible だけを毎秒切り替える。
+                                with gr.Group(visible=False) as upscale_cancel_group:
+                                    upscale_cancel_btn = gr.Button(
+                                        UPSCALE_CANCEL_LABEL,
+                                        variant="stop",
+                                        elem_classes=["h3-tap"],
+                                    )
+                            upscale_status_md = gr.Markdown(_upscale_status_text())
 
                         # ---- P5.3-B: アプリ内ゴミ箱。**実在する動画を選んだ
                         # ときだけ**現れる（記録だけの動画はそもそも一覧に出ない）
@@ -2537,56 +2780,34 @@ def build_ui(
                 # ---- 連結の状態（チェーン連結・指定順連結の共通表示）はフル幅
                 concat_status_md = gr.Markdown(initial_videos[2])
 
-            # ------------------------------------------------ ④ 履歴（P4）
+            # ------------------------- ④ 履歴（P4 → P7 で閲覧専用へ再設計）
+            #
+            # **動画への操作は③「完成・編集」だけ**にした（決定D22）。
+            # ここはフィルタと表しか無い「見るだけ」のページで、
+            # プレビュー・詳細・Finder表示・続きを作る・ルート連結・
+            # 記録選択の Dropdown と表示ボタンは**部品ごと削除**した
+            # （隠して残すと、同じ操作が2か所にある状態が続いてしまう）。
+            #
+            # 右カラムが無くなったぶん、表は**ページ幅いっぱい**に使える。
             with gr.Tab("履歴", id="tab_history"):
                 history_filter = gr.Radio(
                     choices=list(HISTORY_FILTERS.keys()),
                     value="すべて",
                     label="状態フィルタ",
                 )
-                initial_history = _history_view("すべて")
-                with gr.Row(elem_classes=["h3-row"]):
-                    with gr.Column(scale=3):
-                        gr.Markdown(
-                            "表は横に長いので、iPhone では**表の中を横になぞる**と"
-                            "残りの列を見られます。",
-                            elem_classes=["h3-note"],
-                        )
-                        history_list_md = gr.Markdown(
-                            initial_history[0], elem_classes=["h3-scroll"]
-                        )
-                        with gr.Row(elem_classes=["h3-row", "h3-tap"]):
-                            history_select = gr.Dropdown(
-                                choices=[],
-                                value=None,
-                                label="詳細を見る記録を選ぶ",
-                                allow_custom_value=True,
-                                interactive=True,
-                            )
-                            history_reload_btn = gr.Button(
-                                "↻ 選んだ記録を表示", size="sm"
-                            )
-                    with gr.Column(scale=2):
-                        history_player = gr.Video(
-                            label="プレビュー（成功した動画のみ）",
-                            interactive=False,
-                            autoplay=False,
-                        )
-                        history_detail_md = gr.Markdown(HISTORY_EMPTY_NOTE)
-                        with gr.Row(elem_classes=["h3-row", "h3-tap"]):
-                            history_continue_btn = gr.Button("この動画の続きを作る")
-                            history_concat_btn = gr.Button("ルートからここまでを連結")
-                            history_reveal_btn = gr.Button("Finderで表示（Macのみ）")
-                        history_msg_md = gr.Markdown("")
-                        gr.Markdown(FINDER_NOTE, elem_classes=["h3-note"])
-                        with gr.Accordion("詳しい情報（サポート用）", open=False):
-                            history_tech_md = gr.Markdown(
-                                "記録を選ぶと、ここに技術的な情報が出ます。"
-                            )
+                gr.Markdown(
+                    "ここは**記録を見るだけ**のページです。"
+                    "動画の再生・続きを作る・連結・整理は「完成・編集」タブで行えます。"
+                    "表は横に長いので、iPhone では**表の中を横になぞる**と"
+                    "残りの列を見られます。",
+                    elem_classes=["h3-note"],
+                )
+                history_list_md = gr.Markdown(
+                    _history_view("すべて"), elem_classes=["h3-scroll", "h3-wide"]
+                )
 
         latest_state = gr.State("")
         selected_video_state = gr.State("")
-        selected_history_state = gr.State("")
         # P5.2: 指定順連結の並び。**ブラウザセッションごと**に独立して持つので、
         # Mac と iPhone を同時に開いても互いの選択が混ざらない（設計書 §23.5）。
         custom_order_state = gr.State([])
@@ -2776,37 +2997,16 @@ def build_ui(
             api_name="on_clear_continuation",
         )
 
-        # ------------------------------------------------ ④履歴タブの配線（P4）
-        history_outputs = [history_list_md, history_select]
+        # ------------------------ ④履歴タブの配線（P4 → P7 で閲覧専用）
+        #
+        # 配線はこれ1本だけ。**入力は状態フィルタ、出力は履歴表1つ**。
+        # 記録の選択・プレビュー・Finder表示・続きを作る・ルート連結の配線は
+        # 部品ごと削除した（③「完成・編集」に一本化。決定D22）。
         history_filter.change(
             on_history_filter,
             inputs=history_filter,
-            outputs=history_outputs,
+            outputs=history_list_md,
             api_name="on_history_filter",
-        )
-        history_reload_btn.click(
-            on_select_history,
-            inputs=[history_select, history_filter],
-            outputs=[history_player, history_detail_md, history_tech_md],
-            api_name="on_select_history",
-        )
-        history_concat_btn.click(
-            on_history_concat,
-            inputs=history_select,
-            outputs=history_msg_md,
-            api_name="on_history_concat",
-        )
-        history_reveal_btn.click(
-            on_history_reveal,
-            inputs=history_select,
-            outputs=history_msg_md,
-            api_name="on_history_reveal",
-        )
-        history_continue_btn.click(
-            on_history_continuation,
-            inputs=history_select,
-            outputs=[*continuation_outputs, history_msg_md],
-            api_name="on_history_continuation",
         )
 
         timer = gr.Timer(1.0)
@@ -2819,10 +3019,17 @@ def build_ui(
         # ③④も専用ハンドラ。**プレーヤーとプレビューは outputs に入れない**ので、
         # 毎 tick の更新で再生が中断したり選択が飛んだりしない。
         timer.tick(on_videos_tick, outputs=videos_outputs, api_name="on_videos_tick")
+        # P6: 高品質化の進捗は専用ハンドラで更新する（`on_videos_tick` の
+        # 戻り値の数を変えないための分離）。中止ボタンは実行中だけ現れる。
+        timer.tick(
+            on_upscale_tick,
+            outputs=[upscale_status_md, upscale_cancel_group],
+            api_name="on_upscale_tick",
+        )
         timer.tick(
             on_history_tick,
             inputs=history_filter,
-            outputs=history_outputs,
+            outputs=history_list_md,
             api_name="on_history_tick",
         )
         # 「詳しい情報」は毎秒でなくてよい。iPhone（Wi-Fi 越し）での通信を増やさない
@@ -2860,6 +3067,24 @@ def build_ui(
             outputs=[trash_group, trash_btn, trash_ack],
             api_name=False,
         )
+        # P6: 高品質化セクションも**選択が変わったときだけ**出し入れする。
+        selected_video_state.change(
+            on_selection_changed_for_upscale,
+            inputs=selected_video_state,
+            outputs=[upscale_group, upscale_btn, upscale_note_md],
+            api_name=False,
+        )
+        upscale_btn.click(
+            on_start_upscale,
+            inputs=video_select,
+            outputs=[videos_msg_md, upscale_status_md],
+            api_name="on_start_upscale",
+        )
+        upscale_cancel_btn.click(
+            on_cancel_upscale,
+            outputs=[videos_msg_md, upscale_status_md],
+            api_name="on_cancel_upscale",
+        )
         trash_btn.click(
             on_move_to_trash,
             inputs=[video_select, trash_ack],
@@ -2876,18 +3101,6 @@ def build_ui(
                 videos_msg_md,
             ],
             api_name="on_move_to_trash",
-        )
-        history_select.change(
-            lambda key: str(key or ""),
-            inputs=history_select,
-            outputs=selected_history_state,
-            api_name=False,
-        )
-        selected_history_state.change(
-            on_select_history,
-            inputs=[selected_history_state, history_filter],
-            outputs=[history_player, history_detail_md, history_tech_md],
-            api_name=False,
         )
 
     return demo

@@ -39,7 +39,6 @@ from app.ui.minimal import (
     CUSTOM_REMOVE_LABEL,
     CUSTOM_UP_LABEL,
     FINDER_NOTE,
-    HISTORY_EMPTY_NOTE,
     MOBILE_BREAKPOINT_PX,
     MOBILE_CSS,
     STEP_CHOICES,
@@ -129,7 +128,11 @@ def p4_history_table(mobile_app):
     service.submit_generation_ex(
         prompt="履歴表の確認用", num_frames=56, steps=4, seed_requested=7
     )
-    return str(client.predict("すべて", api_name="/on_history_filter")[0])
+    result = client.predict("すべて", api_name="/on_history_filter")
+    # P7 で ④の出力は履歴表1つだけになった。出力が1つの経路では
+    # gradio_client は**タプルではなく値そのもの**を返す
+    assert not isinstance(result, (list, tuple)), "④の出力が1つに絞られていません"
+    return str(result)
 
 
 @pytest.fixture()
@@ -382,8 +385,9 @@ def test_detail_accordions_exist_on_every_tab_that_shows_technical_text(ui_confi
     accordions = _components(ui_config, "accordion")
     labels = [str(a.get("props", {}).get("label") or "") for a in accordions]
     detail = [label for label in labels if "詳しい情報" in label]
-    # ①アプリの動作ログ・②サポート用・③完成動画・④履歴 の4か所
-    assert len(detail) >= 4, labels
+    # ①アプリの動作ログ・②サポート用・③完成・編集 の3か所。
+    # ④履歴の分は P7 で廃止した（技術情報を見る操作も③へ一本化した）
+    assert len(detail) >= 3, labels
     assert all(not a.get("props", {}).get("open") for a in accordions if "詳しい情報" in str(a.get("props", {}).get("label") or ""))
 
 
@@ -858,11 +862,15 @@ def test_history_tab_still_has_its_table(offline_demo, p4_history_table):
 
     起動直後は0件で見出し行が出ないため、(a) 表を出す部品が Timer の出力先として
     今もあること (b) 記録があるときに実際に表が描かれること、の両方を見る。
+    P7 で Timer の出力は**この表だけ**になった。
     """
     _cfg, _service, demo = offline_demo
     by_api = {f.api_name: f for f in demo.fns.values()}
-    table = by_api["on_history_tick"].outputs[0]
+    outputs = by_api["on_history_tick"].outputs
+    assert len(outputs) == 1, "Timer が履歴表以外も更新しています"
+    table = outputs[0]
     assert "h3-scroll" in list(getattr(table, "elem_classes", []) or [])
+    assert "h3-wide" in list(getattr(table, "elem_classes", []) or [])
     assert "履歴" in str(table.value)
 
     assert "| 状態 | 種別 | 日時 | ID |" in p4_history_table
@@ -930,27 +938,26 @@ def test_old_completed_tab_guidance_is_gone_everywhere(ui_config, mobile_app):
     ]
     assert OLD_VIDEOS_EMPTY_NOTE not in values
 
-    for api_name, args in (("/on_select_video", ("",)), ("/on_select_history", ("", "すべて"))):
-        _video, meta, _tech = client.predict(*args, api_name=api_name)
-        assert meta != OLD_VIDEOS_EMPTY_NOTE, api_name
+    # ④のプレビュー経路は P7 で廃止したので、残っている③だけを確認する
+    _video, meta, _tech = client.predict("", api_name="/on_select_video")
+    assert meta != OLD_VIDEOS_EMPTY_NOTE
 
 
-def test_history_tab_keeps_its_own_guidance(ui_config, mobile_app):
-    """④は選択欄が一覧の下のままなので、③の文言を流用しない（P5.1）。
+def test_history_tab_has_no_record_selector_anymore(ui_config):
+    """④から記録選択の欄と表示ボタンを**部品ごと**無くした（P7・決定D22）。
 
-    案内文を1つに共通化すると、④で「上の選択欄から」という誤った案内になる。
+    以前は④にも選択欄・プレビュー・操作ボタンがあり、③と役割が重複していた。
+    隠すだけでは同じ操作が2か所にある状態が続くので、部品自体を削除する。
     """
-    client, _svc, _demo, _port = mobile_app
+    labels = [str(d["props"].get("label") or "") for d in _components(ui_config, "dropdown")]
+    assert not any("記録を選ぶ" in label for label in labels)
 
-    assert "選択欄" not in HISTORY_EMPTY_NOTE
-    assert HISTORY_EMPTY_NOTE != VIDEOS_EMPTY_NOTE
+    values = [str(b["props"].get("value") or "") for b in _components(ui_config, "button")]
+    assert "↻ 選んだ記録を表示" not in values
 
-    _video, detail, _tech = client.predict("", "すべて", api_name="/on_select_history")
-    assert detail == HISTORY_EMPTY_NOTE
-
-    # ④のボタン名は「記録」。③の「選んだ動画を表示」を案内してはいけない
-    history_btn = _only(_by_value(ui_config, "button", "↻ 選んだ記録を表示"), "履歴の表示ボタン")
-    assert history_btn is not None
+    # ③の選択欄と表示ボタンは残っている（④だけを消したことの確認）
+    assert any("表示する動画を選ぶ" in label for label in labels)
+    assert "↻ 選んだ動画を表示" in values
 
 
 # ------------------------------------------------- P5.2 指定順連結（③タブ）
@@ -1251,11 +1258,12 @@ def test_timer_still_never_touches_the_custom_concat_editing_state(offline_demo)
 def test_custom_concat_panel_has_its_own_class(ui_config):
     """連結セクションが専用クラスのパネルになっている（Gradio 既定背景に任せない）。
 
-    P5.3-B で整理セクションにも同じパネル装飾を使うので、`.h3-panel` は2つある。
-    ここでは**連結の操作を含むほう**が正しくパネルになっていることを見る。
+    P5.3-B で整理セクション、P6 で高品質化セクションにも同じパネル装飾を使うので、
+    `.h3-panel` は3つある。ここでは**連結の操作を含むほう**が正しく
+    パネルになっていることを見る。
     """
     panels = [c for c in ui_config["components"] if "h3-panel" in _classes(c)]
-    assert len(panels) == 2, "連結パネルと整理パネルの2つがあるはず"
+    assert len(panels) == 3, "連結パネル・整理パネル・高品質化パネルの3つがあるはず"
     assert all(p["type"] == "group" for p in panels)
 
     parents = _parents(ui_config)
@@ -1417,14 +1425,20 @@ def test_appearance_change_does_not_touch_the_wiring(offline_demo):
 
 
 def test_trash_section_is_hidden_until_a_video_is_selected(ui_config):
-    """整理セクションは**動画を選ぶまで隠れている**（誤操作を減らす）。"""
+    """整理セクションは**動画を選ぶまで隠れている**（誤操作を減らす）。
+
+    P6 の高品質化セクションも同じ方針なので、初期非表示のパネルは2つある。
+    ここでは**整理の見出しを含むほう**が隠れていることを確かめる。
+    """
     panels = [c for c in ui_config["components"] if "h3-panel" in _classes(c)]
     hidden = [p for p in panels if p["props"].get("visible") is False]
-    assert len(hidden) == 1, "初期非表示の整理パネルが1つあるはず"
+    assert len(hidden) == 2, "初期非表示の整理パネルと高品質化パネルがあるはず"
 
-    heading = _only(_by_value(ui_config, "markdown", "### この動画を整理する"), "見出し")
     parents = _parents(ui_config)
-    assert parents[heading["id"]] == hidden[0]["id"]
+    hidden_ids = {p["id"] for p in hidden}
+    for heading_text in ("### この動画を整理する", "### この動画を1080pにする"):
+        heading = _only(_by_value(ui_config, "markdown", heading_text), "見出し")
+        assert parents[heading["id"]] in hidden_ids
 
 
 def test_trash_button_is_a_stop_variant_and_starts_hidden(ui_config):
@@ -1509,4 +1523,5 @@ def test_no_restore_or_hidden_filter_ui_exists(ui_config):
         c[0] if isinstance(c, (list, tuple)) else c for c in radios[0]["props"]["choices"]
     ]
     assert not any("ゴミ箱" in c or "非表示" in c for c in choices)
-    assert choices[-1] == "連結成果物"  # P5.3-A のまま
+    # 種類で絞る2つ（P5.3-A の連結成果物・P6 の1080p成果物）が末尾に並ぶ
+    assert choices[-2:] == ["連結成果物", "1080p成果物"]

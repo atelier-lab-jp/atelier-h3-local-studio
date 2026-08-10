@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app.core import naming
-from app.core.config import AppConfig
+from app.core.config import FIXED_FPS, AppConfig
 from app.core.contracts import (
     BackendIdentity,
     JobSpec,
@@ -202,12 +202,12 @@ class VideoRow:
     """③完成動画タブ・④履歴タブの1行（不変）。"""
 
     job_id: str
-    kind: str  # "clip"（個別動画） | "concat"（連結動画）
+    kind: str  # "clip"（個別動画） | "concat"（連結動画） | "upscaled"（1080p高品質版・P6）
     video_path: Path | None
     exists: bool
     created_at: datetime | None
     duration_label: str
-    steps: int
+    steps: int | None
     num_frames: int
     seed_requested: int | None
     seed_used: int | None
@@ -226,10 +226,24 @@ class VideoRow:
     #: 個別動画では None。**表示上はどちらも「連結」だが記録先が違う**
     #: （chain＝履歴の concat_path ／ manual＝concat_manifest.json）ため内部では必ず区別する。
     concat_kind: str | None = None
+    #: 1080p高品質版（P6）が何から作られたか。台帳は持たず**ファイル名から復元する**。
+    #: 元動画がゴミ箱へ移動されていても、ここは名前に残った値をそのまま指す。
+    upscale_source_kind: str | None = None
+    upscale_source_id: str | None = None
+
+    @property
+    def is_upscaled(self) -> bool:
+        """1080p高品質版そのものか（さらに高品質化することはできない）。"""
+        return self.kind == "upscaled"
 
     @property
     def label(self) -> str:
-        mark = "🔗連結" if self.kind == "concat" else "🎬"
+        if self.kind == "upscaled":
+            mark = "🎞1080p"
+        elif self.kind == "concat":
+            mark = "🔗連結"
+        else:
+            mark = "🎬"
         missing = "" if self.exists else "（ファイルなし）"
         when = self.created_at.strftime("%m-%d %H:%M") if self.created_at else "--"
         return f"{mark} {self.job_id} / {when} / {self.duration_label}{missing}"
@@ -320,6 +334,10 @@ class AppService:
         self._trash_lock = threading.Lock()
         # 連結サービス（P4/P5.2）。ffmpeg レーンは生成キューと別（設計書 §7 決定D5）
         self._concat = self._make_concat_service()
+        # 1080p高品質化（P6）。生成と同じ GPU を使うので**同時には走らせない**
+        # （排他は _upscale_blocked_reason / _busy_reason の相互チェックで行う。§26.6）
+        self._upscale = self._make_upscale_service()
+        self._upscale_lock = threading.Lock()
 
     def _make_concat_manifest(self):
         """台帳を作る。作れなくても UI は起動する（任意連結だけが使えなくなる）。"""
@@ -346,6 +364,21 @@ class AppService:
             )
         except Exception:
             log.exception("連結サービスを初期化できませんでした（連結機能は無効になります）")
+            return None
+
+    def _make_upscale_service(self):
+        """高品質化サービスを作る。作れなくても UI は起動する（この機能だけ無効）。"""
+        try:
+            from app.core.upscale_service import UpscaleService
+
+            return UpscaleService(
+                self.cfg,
+                worker_script=self.cfg.upscale_worker_script,
+                weights_path=self.cfg.upscale_weights_path,
+                ffmpeg_path=self.cfg.ffmpeg_path,
+            )
+        except Exception:
+            log.exception("高品質化サービスを初期化できませんでした（この機能は無効になります）")
             return None
 
     # ---------------------------------------------------------------- 構築
@@ -410,9 +443,22 @@ class AppService:
             stall_abort_factor=cfg.stall_abort_factor,
             intake_guard=lambda: disk_block_reason(cfg),
         )
-        return cls(
+        service = cls(
             cfg, history=history, engine=engine, queue=queue, execution_engine=mode
         )
+        # 高品質化中は次の生成を**開始しない**（待機列はそのまま保持する。§26.6）。
+        # サービス生成後にしか参照できないので、ここで配線する。
+        queue.set_dispatch_guard(service._generation_hold_reason)
+        return service
+
+    def _generation_hold_reason(self) -> str | None:
+        """次の生成の開始を見送る理由（無ければ None）。同じGPUを奪い合わせない。"""
+        try:
+            if self._upscale_running():
+                return "1080pへの高品質化が実行中のため、生成の開始を待っています"
+        except Exception:  # pragma: no cover - 状態が取れないことを理由に止めない
+            log.exception("高品質化の状態を取得できませんでした")
+        return None
 
     # ---------------------------------------------------------------- 開始/停止
 
@@ -464,6 +510,11 @@ class AppService:
                 self._concat.shutdown(timeout=timeout)
             except Exception:
                 log.exception("連結サービスの停止でエラーが発生しました")
+        if self._upscale is not None:
+            try:
+                self._upscale.shutdown(timeout=timeout)
+            except Exception:
+                log.exception("高品質化サービスの停止でエラーが発生しました")
 
     # ---------------------------------------------------------------- 投入
 
@@ -864,6 +915,107 @@ class AppService:
             manual_concats=manuals,
         )
 
+    # ------------------------------------------- P6: 1080p高品質化の成果物
+    #
+    # **台帳を持たない**（P5.3-B と同じ簡易方式）。どの動画に高品質版があるかは
+    # 「決まった名前のファイルが在るか」だけで決まる。履歴にも台帳にも書かない。
+
+    def upscaled_path_for(self, job_id: str, kind: str = "clip") -> Path | None:
+        """この成果物に対応する1080p版の**決まった置き場所**（無くても返す）。
+
+        `kind` は表示上の種別（clip / concat）。連結はさらにチェーン／指定順で
+        分かれるため、内部種別（chain / manual）へ寄せてから名前を決める。
+        """
+        from app.core.naming import is_safe_artifact_id, upscaled_filename
+
+        job_id = str(job_id or "").strip()
+        if not is_safe_artifact_id(job_id):
+            return None
+        if kind == "clip":
+            source_kind = "clip"
+        elif kind == "concat":
+            from app.core.naming import is_valid_manual_concat_id
+
+            source_kind = "manual" if is_valid_manual_concat_id(job_id) else "chain"
+        else:
+            return None
+        try:
+            return self.cfg.upscaled_dir / upscaled_filename(source_kind, job_id)
+        except ValueError:
+            return None
+
+    def _upscaled_row(self, path: Path) -> VideoRow | None:
+        """1080p成果物のファイル1つから表示用の行を作る（元レコードは参照だけ）。"""
+        from app.core.naming import UPSCALE_SOURCE_KINDS
+
+        name = path.name
+        if not name.startswith("u_") or not name.endswith("_1080p.mp4"):
+            return None
+        middle = name[len("u_") : -len("_1080p.mp4")]
+        source_kind, _, source_id = middle.partition("_")
+        if source_kind not in UPSCALE_SOURCE_KINDS or not source_id:
+            return None
+
+        source = self.find_row(
+            source_id, "clip" if source_kind == "clip" else "concat"
+        )
+        try:
+            created = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+        except OSError:  # pragma: no cover - 実行環境依存
+            created = None
+        duration = getattr(source, "duration_label", "—") if source else "—"
+        frames = getattr(source, "num_frames", 0) if source else 0
+        return VideoRow(
+            job_id=name[: -len(".mp4")],
+            kind="upscaled",
+            video_path=path,
+            exists=True,
+            created_at=created,
+            duration_label=duration,
+            steps=None,
+            num_frames=frames,
+            seed_requested=None,
+            seed_used=None,
+            prompt_head="",
+            parent_id=source_id,
+            chain_length=None,
+            backend_id=getattr(source, "backend_id", "") if source else "",
+            model_revision=getattr(source, "model_revision", "") if source else "",
+            elapsed_sec=None,
+            concat_sources=(),
+            status="success",
+            error=None,
+            error_category=None,
+            execution_engine=getattr(source, "execution_engine", "") if source else "",
+            concat_kind=None,
+            upscale_source_kind=source_kind,
+            upscale_source_id=source_id,
+        )
+
+    def upscaled_rows(self) -> list[VideoRow]:
+        """1080p高品質版だけを新しい順で返す（**実在するファイルから作る**）。
+
+        元動画がゴミ箱へ移動されていても、高品質版が在れば独立して残る。
+        """
+        directory = self.cfg.upscaled_dir
+        if not directory.is_dir():
+            return []
+        rows: list[VideoRow] = []
+        try:
+            for path in sorted(directory.glob("u_*_1080p.mp4")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                row = self._upscaled_row(path)
+                if row is not None:
+                    rows.append(row)
+        except OSError:  # pragma: no cover - 実行環境依存
+            log.exception("1080p高品質版の一覧を取得できませんでした")
+            return []
+        rows.sort(
+            key=lambda r: (r.created_at is not None, r.created_at, r.job_id), reverse=True
+        )
+        return rows
+
     def concat_product_rows(self) -> list[VideoRow]:
         """連結成果物だけを新しい順で返す（④履歴タブの「連結成果物」フィルタ用）。
 
@@ -909,6 +1061,17 @@ class AppService:
         """
         from app.core.naming import is_valid_manual_concat_id
 
+        if kind == "upscaled":
+            # 1080p成果物は台帳を持たない。**そのファイルが在るかどうか**が唯一の根拠。
+            from app.core.naming import is_safe_artifact_id
+
+            name = str(job_id)
+            if not is_safe_artifact_id(name):
+                return None
+            path = self.cfg.upscaled_dir / f"{name}.mp4"
+            if path.is_symlink() or not path.is_file():
+                return None
+            return self._upscaled_row(path)
         if kind == "concat" and is_valid_manual_concat_id(str(job_id)):
             if self.concat_manifest is None:
                 return None
@@ -1005,10 +1168,25 @@ class AppService:
 
     # ---------------------------------------------------------------- P4: 連結・Finder
 
+    def _concat_hold_reason(self) -> str | None:
+        """連結を始められない理由（P6の排他。無ければ None）。
+
+        高品質化は ffmpeg も使うので、連結と同時に走らせない。
+        """
+        try:
+            if self._upscale_running():
+                return "1080pへの高品質化が実行中です。完了してからお試しください。"
+        except Exception:  # pragma: no cover - 状態が取れないことを理由に止めない
+            log.exception("高品質化の状態を取得できませんでした")
+        return None
+
     def start_concat(self, job_id: str) -> str:
         """ルートから指定動画までを連結する（バックグラウンド開始・日本語メッセージ）。"""
         if self._concat is None:
             return "連結機能を利用できません"
+        blocked = self._concat_hold_reason()
+        if blocked:
+            return blocked
         try:
             self._concat.start_concat(job_id)
         except Exception as e:
@@ -1024,6 +1202,9 @@ class AppService:
         """
         if self._concat is None:
             return "連結機能を利用できません"
+        blocked = self._concat_hold_reason()
+        if blocked:
+            return blocked
         ids = [str(v).strip() for v in (job_ids or [])]
         try:
             self._concat.start_custom_concat(ids)
@@ -1035,6 +1216,105 @@ class AppService:
 
     def concat_status(self):
         return self._concat.status() if self._concat is not None else None
+
+    # ------------------------------------------- P6: 選んだ動画の1080p高品質化
+
+    def upscale_available(self) -> tuple[bool, str]:
+        """高品質化を使える状態か（使えるか, 日本語の理由）。"""
+        if self._upscale is None:
+            return False, "高品質化の機能を初期化できませんでした。"
+        return self._upscale.availability()
+
+    def upscale_status(self):
+        return self._upscale.status() if self._upscale is not None else None
+
+    def cancel_upscale(self) -> str:
+        if self._upscale is None:
+            return "高品質化の機能を利用できません。"
+        return self._upscale.cancel()
+
+    def _upscale_running(self) -> bool:
+        status = self.upscale_status()
+        return bool(status is not None and status.running)
+
+    def start_upscale(self, job_id: str, kind: str = "clip") -> tuple[bool, str]:
+        """選ばれた動画の1080p版を作り始める（成功したか, 日本語メッセージ）。
+
+        UI から来るのは**選択キーだけ**で、元動画の場所も出力先もここで決める
+        （ブラウザから受け取ったパスは使わない。設計書 §15・§26.3）。
+        """
+        from app.core.upscale_service import UpscaleError, UpscaleRequest
+
+        if self._upscale is None:
+            return False, "高品質化の機能を利用できません。"
+        available, reason = self.upscale_available()
+        if not available:
+            return False, reason
+
+        kind = str(kind or "clip").strip()
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            return False, "高品質化する動画を選んでください。"
+        if kind == "upscaled":
+            return False, "この動画はすでに1080p高品質版です。"
+        if kind not in ("clip", "concat"):
+            return False, f"高品質化できない種別です: {kind}"
+
+        with self._upscale_lock:
+            busy = self._busy_reason()
+            if busy:
+                return False, busy
+
+            row = self.find_row(job_id, kind)
+            if row is None or not row.exists or row.video_path is None:
+                return False, "動画が見つかりません。一覧を更新してからお試しください。"
+
+            output = self.upscaled_path_for(row.job_id, kind)
+            if output is None:
+                return False, "この動画は高品質化できません（IDの形式が想定と違います）。"
+            # すでにある正しい成果物は作り直さない（設計書 §26.9）
+            if self._is_valid_upscaled(output):
+                return False, f"1080p高品質版はすでにあります（{output.name}）。"
+
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                log.exception("高品質化の保存先を用意できませんでした")
+                return False, f"保存先を用意できませんでした（{e}）"
+
+            try:
+                self._upscale.start_upscale(
+                    UpscaleRequest(
+                        source_key=f"{kind}:{row.job_id}",
+                        source_path=row.video_path,
+                        output_path=output,
+                        num_frames=int(row.num_frames or 0),
+                        # V1 は 24fps 固定（config が検証で強制している値）
+                        fps=FIXED_FPS,
+                        label=row.label,
+                    )
+                )
+            except UpscaleError as e:
+                return False, str(e)
+            except Exception as e:  # pragma: no cover - 想定外
+                log.exception("高品質化を開始できませんでした: %s:%s", kind, job_id)
+                return False, f"高品質化を開始できませんでした（{e}）"
+
+        log.info("高品質化を開始: %s:%s → %s", kind, row.job_id, output.name)
+        return True, "1080pへの高品質化を開始しました。完了までお待ちください。"
+
+    def _is_valid_upscaled(self, path: Path) -> bool:
+        """作り直しを省いてよい成果物か。
+
+        正式名のファイルは、解像度・フレーム数・音声・再生時間をすべて確かめた
+        あとでしか作られない（`UpscaleService._verify_and_promote` → `promote`）。
+        中途半端な出力は `.partial` のまま消えるので、ここでは
+        **正式名で在ること・中身が空でないこと**だけを見れば足りる。
+        """
+        try:
+            return not path.is_symlink() and path.is_file() and path.stat().st_size > 0
+        except OSError:  # pragma: no cover - 実行環境依存
+            return False
 
     # ------------------------------------------------- P5.3-B: アプリ内ゴミ箱
 
@@ -1056,6 +1336,11 @@ class AppService:
                 return "動画の生成または連結が実行中です。完了してから整理してください。"
         except Exception:  # pragma: no cover
             log.exception("連結の状態を取得できませんでした")
+        try:
+            if self._upscale_running():
+                return "1080pへの高品質化が実行中です。完了してからお試しください。"
+        except Exception:  # pragma: no cover
+            log.exception("高品質化の状態を取得できませんでした")
         return None
 
     def _trash_targets(self, row: VideoRow) -> list[Path]:
@@ -1063,8 +1348,10 @@ class AppService:
 
         - 個別動画: 本体の MP4 と、あれば最終フレーム PNG
         - 連結動画（チェーン・指定順とも）: 選ばれた連結 MP4 だけ
+        - 1080p高品質版（P6）: その MP4 だけ
 
         素材・親・子・他の連結成果物は**含めない**（連動削除はしない。§25.5）。
+        元動画を整理しても 1080p 版は残り、1080p 版を整理しても元動画は残る。
         """
         paths: list[Path] = []
         if row.video_path is not None:
@@ -1090,7 +1377,7 @@ class AppService:
         job_id = str(job_id or "").strip()
         if not job_id:
             return False, "整理する動画を選んでください。"
-        if kind not in ("clip", "concat"):
+        if kind not in ("clip", "concat", "upscaled"):
             return False, f"整理できない種別です: {kind}"
 
         with self._trash_lock:

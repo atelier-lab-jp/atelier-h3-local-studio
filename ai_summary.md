@@ -1,11 +1,64 @@
 # ai_summary.md — 現在状態の正本
 
 > この文書は「最新状態の正本」であり、過去ログは積まず常に現在地を表すよう上書き更新する。
-> 経緯は `changelog.md`、恒久ルールは `CLAUDE.md`、設計は `docs/v1-design.md`（v1.8）を参照。
+> 経緯は `changelog.md`、恒久ルールは `CLAUDE.md`、設計は `docs/v1-design.md`（v1.10）を参照。
 
 - **最終更新日**: 2026-08-10
 - **プロジェクトの目的**: Mac mini（M4・24GB・MPS）上で動く完全ローカルの音声付き動画生成アプリ。初心者がブラウザ（Gradio・日本語UI・localhost限定）から MiniMax-H3 動画を生成できるようにする。
-- **現在フェーズ**: **P5.3-B 完了（未コミット）。V1.0.0 Release Candidate（実iPhoneでの最終確認待ち）**
+- **現在フェーズ**: **P6・P7 完了（いずれも未コミット）。V1.0.0 Release Candidate（実iPhoneでの最終確認待ち）**
+
+## P7 で決めたタブの役割分担（2026-08-10）
+
+③と④に同じ操作が2か所ずつ並んでいた状態を解消した。**機能追加はなく UI の整理だけ**。
+設計は `docs/v1-design.md` §27（決定D22）。
+
+| タブ | 役割 |
+|---|---|
+| ③「完成・編集」 | **動画を操作する唯一の場所**（選ぶ・プレビュー・詳細・続きを作る・ルート連結・Finder表示・詳しい情報・指定順連結・1080p高品質化・ゴミ箱へ移動） |
+| ④「履歴」 | **記録を見るだけ**（状態フィルタ＋履歴表のみ） |
+
+- ④から**部品ごと削除**: プレビュー・メタ情報・詳細・プロンプト概要・続きを作る・
+  ルート連結・Finder表示とその説明文・「詳しい情報」の折りたたみ・右カラム全体・
+  記録選択 Dropdown・［↻ 選んだ記録を表示］・④専用の選択 State と配線
+  （**隠して残していない**）
+- **廃止したAPI（意図的）**: `/on_select_history` `/on_history_concat`
+  `/on_history_reveal` `/on_history_continuation`
+- **残したAPI**: `/on_history_filter` `/on_history_tick`。戻り値は 2→**1**（履歴表だけ）。
+  契約は「入力＝状態フィルタ／出力＝履歴表1つ」
+- 履歴表は `.h3-wide` でページ幅いっぱい。セルは折り返さないが**最後の列だけ折り返す**
+  （エラー列の長文で表が何倍にも広がるのを防ぐ）
+- **履歴データ・スキーマ・フィルタ9種・絞り込み処理・表の内容は無変更**。③も無変更
+- 非回帰試験 `tests/test_history_tab_readonly.py`（35件）で、④に操作部品が無いこと・
+  ③が壊れていないこと・孤児 component ID が無いことを機械的に固定した
+
+## P6 で入れた1080p高品質化（2026-08-10）
+
+576×320 の生成結果を、AI で細部を描き足しながら **1920×1080 の別ファイル**にする。
+**生成そのものは何も変えていない**（解像度・fps・フレーム数・ステップ数は V1 固定のまま）。
+設計は `docs/v1-design.md` §26（決定D21）。
+
+- **不採用**（作らない）: `upscale_manifest.json`／履歴・台帳のスキーマ変更／モデル選択UI／
+  x4plus／pad方式／ネイティブ1080p生成／フレーム補間／時間方向SR／CoreML／ncnn／
+  クラウドAPI／画像・音楽入力／復元UI／依存関係グラフ／カスケード削除
+- **モデルは realesr-animevideov3（x4・fp32・MPS）固定**。x4 → 高さ1080へ Lanczos 縮小 →
+  **左右を均等にcrop**（引き伸ばさない）
+- **成果物の名前は `u_{clip|chain|manual}_{ID}_1080p.mp4`。種類を省略しない**
+  （個別動画とチェーン連結は同じ `job_id` を使うので、種類が無いと衝突する）
+- **台帳を持たない** — どの動画に1080p版があるかは**そのファイルが在るか**だけで決まる。
+  元動画を整理しても1080p版は残り、1080p版を整理しても元動画は残る（§25 と同じ方式）
+- **音声は再エンコードせず stream copy**（実測MD5一致）。**`-shortest` は使わない**
+- **排他** — 生成・連結・整理とは同時に走らせない。ただし**生成だけは待機列を保持**して
+  開始のみ待つ（`JobQueue.dispatch_guard`。submit は妨げない。`intake_guard` は不変）
+- **UI は③右カラム**。進捗は専用 Timer `on_upscale_tick`（**`on_videos_tick` の4出力契約は維持**）。
+  中止ボタンは**Timer からボタンを直接更新せず**、包んだ Group の visible で出し入れする。
+  1080p成果物はプレビュー・Finder表示・整理のみ可
+- **④に「1080p成果物」フィルタ**を追加（既存8フィルタは不変）
+- 新規モジュール: `app/postprocess/upscale_worker.py`（DiffSynth venv で一発起動・`app.*` 非依存）と
+  `app/core/upscale_service.py`（1件ずつ・進捗・中止・検証・原子的昇格）
+- **モデルは Git に含めない** — `./scripts/setup.sh --with-upscale` で取得し、
+  **SHA-256 照合後に昇格**。無くても起動でき、起動前チェックは警告どまり
+- **実測**（124フレーム・音声あり・M4/MPS）: **15.6秒**、1920×1080、フレーム数・再生時間は元と同じ、
+  音声MD5一致、元動画は無変更、細部の量は Lanczos の 45.0 に対し **164.8**
 
 ## P5.3-B で入れた動画の整理（2026-08-10・簡易方式）
 
@@ -188,11 +241,14 @@
 
 ## テスト結果（最新）
 
-- **1223 passed + 1 skipped + 1 xpassed**（P4 時点は 625+1。P5 で 367 件、P5.1 で 15 件、
-  P5.2 で 137 件、P5.3-A で 25 件、P5.3-B で 53 件追加）
+- **1350 passed + 1 skipped + 1 xpassed**（P4 時点は 625+1。P5 で 367 件、P5.1 で 15 件、
+  P5.2 で 137 件、P5.3-A で 25 件、P5.3-B で 53 件、P6 で 87 件、P7 で 37 件追加）
+  - P6 の 4 ファイルは**実モデルも MPS も使わず約4秒**で回る
+    （ワーカーは `tests/fixtures/fake_upscale_worker.py` に差し替え）
   - キュー 70／RealEngine 50／MockEngine 41／ワーカー 163／P2統合 13／UI経路 17／履歴 38／P1結合 10／基盤系ほか
 - `setup.sh` 成功、`start.sh --check`（mock/real/deep-check）合格、`--smoke` HTTP 200
 - **ブラウザ相当の実配信検証**: 動画は HTTP 206・`video/mp4` で配信、履歴JSON/ログ/data_root外は 403 拒否
+  （P6 で `data/upscaled` も 206 で配信、`data/trash` は 403 であることを確認）
 - **Ctrl+C 実測**: exit 0・5.2秒で停止（非デーモンスレッドの残留なし）
 - **実機3ステージ合格**（Stage 0 初期化 / Stage 1 生成 / Stage 2 常駐再利用 / Stage 3 ブラウザ）
 
@@ -238,10 +294,12 @@ app/engine/base.py       Engine 共通契約（Protocol）
 app/engine/mock_engine.py  MockEngine（実機と同形のイベント）
 app/engine/real_engine.py  実機エンジン（プロセス管理・検証・昇格）
 app/engine/backends/minimax_h3/h3_worker.py  実機ワーカー（DiffSynth venv で動く自己完結）
+app/core/upscale_service.py  1080p高品質化（1件ずつ・進捗・中止・検証・昇格）
+app/postprocess/upscale_worker.py  高品質化ワーカー（DiffSynth venv・app.* 非依存）
 app/ui/minimal.py        UI（新規生成タブ＋②〜④の骨格）
 scripts/real_stage_test.py  実機試験（stage0/1/2。pytest には含めない）
 config/config.toml       [engine] mode/backend ＋ [backends.minimax_h3]
-data/                    出力・履歴・ログ（唯一の書き込み先・gitignore）
+data/                    出力・履歴・ログ・upscaled・trash（唯一の書き込み先・gitignore）
 tests/                   388テスト（実モデルは使わない）
 ```
 

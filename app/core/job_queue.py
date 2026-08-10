@@ -176,6 +176,11 @@ class JobQueue:
         stall_warn_factor: 目安時間の何倍で「停滞警告」を出すか（**停止はしない**）
         stall_abort_factor: 目安時間の何倍で強制終了するか。**0.0 = 無効（既定）**
         intake_guard: `() -> 受付停止理由 or None`。submit とディスパッチ直前に呼ぶ
+        dispatch_guard: `() -> 待機理由 or None`。**ディスパッチ直前だけ**呼ぶ（P6）。
+            intake_guard と違い submit は妨げないので、待機中のジョブは
+            QUEUED のまま保持され、理由が消えると自動的に開始される。
+            1080p高品質化のように「同じGPUを使うので同時に走らせない」
+            一時的な排他に使う（設計書 §26.6）。
         monotonic: 単調時計（watchdog・バックオフ残り秒。テスト差し替え用）
         sleep: `(秒) -> True=経過 / False=中断`。None なら内部の Event.wait を使う
     """
@@ -197,6 +202,7 @@ class JobQueue:
         stall_warn_factor: float = 3.0,
         stall_abort_factor: float = 0.0,
         intake_guard: Callable[[], str | None] | None = None,
+        dispatch_guard: Callable[[], str | None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], bool] | None = None,
     ) -> None:
@@ -215,6 +221,7 @@ class JobQueue:
         self._stall_warn_factor = max(0.0, float(stall_warn_factor))
         self._stall_abort_factor = max(0.0, float(stall_abort_factor))
         self._intake_guard = intake_guard
+        self._dispatch_guard = dispatch_guard
         self._monotonic = monotonic
         self._sleep: Callable[[float], bool] = (
             sleep if sleep is not None else self._default_sleep
@@ -249,6 +256,8 @@ class JobQueue:
         self._manual_restart_reason: str | None = None  # 手動再起動の要求
         self._backoff_deadline: float | None = None
         self._intake_blocked_reason: str | None = None
+        #: 一時的に「開始だけ」見送っている理由（P6。待機列は捨てない）
+        self._dispatch_blocked_reason: str | None = None
         self._last_intake_check: float | None = None
 
     # ------------------------------------------------------------ ライフサイクル
@@ -495,6 +504,10 @@ class JobQueue:
 
         # ディスパッチ直前の空き容量ガード（設計書 §13.2）。
         if self._check_intake_guard() is not None:
+            return None
+
+        # 一時的な排他（P6・設計書 §26.6）。**待機列はそのまま**にして開始だけ見送る。
+        if self._check_dispatch_guard() is not None:
             return None
 
         if self._refresh_engine_state() is not EngineState.READY:
@@ -1139,6 +1152,43 @@ class JobQueue:
             else:
                 logger.info("空き容量が回復したため受付を再開しました")
         return reason_or_none
+
+    def _check_dispatch_guard(self) -> str | None:
+        """`dispatch_guard()` を呼び、開始を見送る理由を返す（ロックの外で呼ぶこと）。
+
+        受付は止めない（submit は通る）。理由が消えれば次のディスパッチで
+        待機中のジョブがそのまま開始される。
+        """
+        if self._dispatch_guard is None:
+            return None
+        try:
+            raw = self._dispatch_guard()
+        except Exception:
+            # 状態を確認できないことを理由に生成を止めない（intake_guard と同じ方針）。
+            logger.exception("開始可否の確認に失敗しました（生成は継続します）")
+            return None
+        reason = str(raw).strip() if raw else ""
+        reason_or_none = reason or None
+        with self._lock:
+            changed = reason_or_none != self._dispatch_blocked_reason
+            self._dispatch_blocked_reason = reason_or_none
+        if changed:
+            if reason_or_none:
+                logger.info("次の生成の開始を見送ります: %s", reason_or_none)
+            else:
+                logger.info("生成の開始を再開します")
+        return reason_or_none
+
+    def set_dispatch_guard(self, guard: Callable[[], str | None] | None) -> None:
+        """開始見送りの判定を差し替える（配線の都合で構築後に渡す場合に使う）。"""
+        with self._lock:
+            self._dispatch_guard = guard
+
+    @property
+    def dispatch_blocked_reason(self) -> str | None:
+        """いま開始を見送っている理由（UI の案内用。無ければ None）。"""
+        with self._lock:
+            return self._dispatch_blocked_reason
 
     def _refresh_intake_guard_if_idle(self) -> None:
         """待機ジョブが無いときも、UI のバナー用に控えめな間隔で再確認する。"""

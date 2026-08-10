@@ -19,6 +19,8 @@ models/
 *.safetensors
 *.ckpt
 *.bin
+# 高品質化のモデル（P6）も同じ扱い。`app/assets/upscale/*.pth` は
+# `./scripts/setup.sh --with-upscale` が取得する（リポジトリには入れない）。
 *.pth
 
 # ---- 生成物・履歴・ログ（ユーザー固有。復元不能なので必ずバックアップを） ----

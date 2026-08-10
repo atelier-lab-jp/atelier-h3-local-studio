@@ -706,7 +706,8 @@ def test_trash_is_not_in_the_served_paths(cfg, app):
     add_clip(cfg, app, "v_20260810_100000_aaaa")
     assert app.move_to_trash("v_20260810_100000_aaaa", "clip")[0]
 
-    allowed = [str(cfg.outputs_dir), str(cfg.concat_dir)]
+    # main.py の allowed_paths と同じ並び（P6 で 1080p 成果物が加わった）
+    allowed = [str(cfg.outputs_dir), str(cfg.concat_dir), str(cfg.upscaled_dir)]
     moved = trash_dir(cfg.data_root) / "v_20260810_100000_aaaa.mp4"
     assert moved.is_file()
     assert not any(str(moved).startswith(a) for a in allowed)
