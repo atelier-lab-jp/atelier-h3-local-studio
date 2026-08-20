@@ -46,6 +46,9 @@ class UpscaleWorkerError(Exception):
 #
 # realesr-animevideov3 のネットワーク（basicsr の srvgg_arch と互換）。
 # basicsr パッケージを既存 venv へ追加しないよう、必要な部分だけ自己実装する。
+# アーキテクチャは Real-ESRGAN（BSD-3-Clause, Copyright (c) 2021, Xintao Wang,
+# https://github.com/xinntao/Real-ESRGAN）の SRVGGNetCompact に基づく。
+# ライセンス全文と帰属の詳細は THIRD-PARTY-NOTICES.md。
 
 
 def _build_model(torch, nn, F):

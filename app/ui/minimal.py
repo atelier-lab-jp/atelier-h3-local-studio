@@ -1181,9 +1181,14 @@ def build_ui(
         履歴JSON・ログ・`data/trash`・data_root 外は、たとえ履歴に書かれていても
         配信しない。実在しないものは None にする。
 
-        **`app/main.py` の `allowed_paths` と同じ並びにしておくこと**（片方だけ
-        増やすと、画面には出るのに再生できない動画ができてしまう。P6 で実際に
-        `data/upscaled` を足し忘れて起きた）。
+        **既定の bases は `app/main.py` の `allowed_paths` と同じ並びにしておくこと**
+        （片方だけ増やすと、画面には出るのに再生できない動画ができてしまう。P6 で
+        実際に `data/upscaled` を足し忘れて起きた）。
+
+        `allow_tmp=True` は継続サムネイル1件だけの例外で、サーバ側が値として渡す
+        個別ファイルを Gradio が自前で供給するため成立している。ディレクトリ全体を
+        ブラウザから要求可能にする `allowed_paths` へは `data/tmp` を**決して加えない**
+        （QR 画像などの一時ファイルが HTTP で見えてしまう）。
         """
         if path is None or path == "":
             return None

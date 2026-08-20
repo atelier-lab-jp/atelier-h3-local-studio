@@ -32,6 +32,10 @@ partial へ移す。詳細は ``temp_encode_path`` の docstring。正式名は�
   2 = 起動時の環境変数・資産検証エラー
   3 = モデル / LoRA 初期化エラー
   4 = 生成中の fatal エラー（P2 では自動再起動しないのでプロセスを終える）
+
+パイプライン呼び出し（MiniMaxH3Pipeline / ModelConfig / write_video_audio の用法）は
+DiffSynth-Studio（Apache-2.0, https://github.com/modelscope/DiffSynth-Studio）の
+利用例に基づく。帰属の詳細は THIRD-PARTY-NOTICES.md。
 """
 
 from __future__ import annotations

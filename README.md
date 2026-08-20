@@ -27,6 +27,7 @@
 9. [困ったときは](#9-困ったときは)
 10. [してはいけないこと](#10-してはいけないこと)
 11. [開発者向け](#11-開発者向け)
+12. [ライセンスと第三者ソフトウェア](#12-ライセンスと第三者ソフトウェア)
 
 ---
 
@@ -35,11 +36,19 @@
 | 項目 | 内容 |
 |---|---|
 | パソコン | Apple シリコンの Mac（macOS）。動作確認は Mac mini M4・メモリ24GB |
-| 生成の中身 | DiffSynth-Studio と MiniMax-H3 のモデル一式（別途セットアップ済みであること） |
+| コマンドラインツール | **uv（必須）**。`setup.sh` が Python 環境を作るのに使います。未導入なら <https://docs.astral.sh/uv/> の手順で先に入れてください |
+| 生成の中身 | DiffSynth-Studio と MiniMax-H3 のモデル一式（[2章の「実モデルの準備」](#実モデルの準備実機モードに必要)を参照。**モデルは本リポジトリに含まれていません**） |
 | ブラウザ | Safari / Chrome など |
 | インターネット | **不要**（初回の準備でだけ使います） |
 
-「画面の動きだけ試したい」場合は、モデルが無くても**お試しモード**で動かせます（[11章](#11-開発者向け)）。
+「画面の動きだけ試したい」場合は、モデルが無くても**お試しモード**で動かせます。
+**clone した直後は、まず次の2つを実行してお試しモードで動作確認するのがおすすめです**
+（モデル不要・数分で終わります）:
+
+```
+./scripts/setup.sh
+./scripts/start.sh --mode mock
+```
 
 ---
 
@@ -54,6 +63,9 @@
 cd ~/dev/atelier-h3-local-studio   # 実際に置いた場所に読み替えてください
 ./scripts/setup.sh
 ```
+
+> `setup.sh` は **uv** を使います。未導入だと「エラー: uv が見つかりません」で
+> 止まるので、<https://docs.astral.sh/uv/> の手順で先に導入してください。
 
 3. 文字がたくさん流れます。最後に「完了」と出れば成功です（数分かかることがあります）。
 
@@ -74,6 +86,40 @@ cd ~/dev/atelier-h3-local-studio   # 実際に置いた場所に読み替えて�
 
 付けなくてもアプリは問題なく起動します（この機能だけが使えません）。
 あとから付け足したくなったら、いつでも上のコマンドを実行できます。
+
+### 実モデルの準備（実機モードに必要）
+
+実機モード（実際の AI 生成）には、DiffSynth-Studio とモデル一式が別途必要です。
+**モデルの weight は本リポジトリに含まれていません。**
+
+`config/config.toml` の `[backends.minimax_h3]` `working_directory`
+（DiffSynth-Studio のルート）を基準に、起動前チェックは次の資産を検査します。
+
+| 資産 | 場所（`working_directory` 基準） |
+|---|---|
+| MiniMax-H3-NF4 量子化モデル | `models/DiffSynth-Studio/MiniMax-H3-NF4/` の `minimax-h3-fl2va-nf4.safetensors`・`minimax-h3-text-encoder-nf4.safetensors`・`video_vae_nf4.safetensors`・`audio_vae_nf4.safetensors` |
+| MiniMax-H3 processor | `models/MiniMax/MiniMax-H3/FL2VA/`（`processor/` を含む） |
+| Turbo LoRA | `models/loras/minimax_h3_turbo_4step_ckpt500.safetensors` |
+
+そろっているかは次のコマンドで確認できます。
+
+```
+./scripts/start.sh --check --mode real
+```
+
+**取得元とライセンスについて（実機モードを使う前に必ずお読みください）**
+
+- ベースモデル **MiniMax H3** は **MiniMax H3 Community License Agreement
+  （独自ライセンス）** で配布されています。条文には**地域に関する制限**や
+  **商用利用に関する条件**が含まれており、誰でも無条件に利用できるわけではありません。
+  利用の可否は、配布元の最新の条文をご自身で確認して判断してください。
+- **NF4 量子化版**（ModelScope: `DiffSynth-Studio/MiniMax-H3-NF4`）と
+  **Turbo LoRA**（Hugging Face: `larryvrh/MiniMax-H3-Turbo-Lora`）の配布ページは
+  Apache-2.0 表記ですが、どちらも MiniMax H3 由来のモデルであるため、
+  ベースモデルの Community License との関係（派生モデルの扱い）を含めて
+  **両方の条文をご自身で確認**してください。
+- 取得元 URL・ライセンス情報の詳細は
+  [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) にまとめてあります。
 
 ---
 
@@ -496,38 +542,24 @@ Mac mini M4（メモリ24GB）での実測です。
 
 ---
 
-## 付録: Git 管理を始めるときに（開発者向け）
+## 12. ライセンスと第三者ソフトウェア
 
-このプロジェクトはまだ Git 管理を開始していません（コミット0件）。
-すべて確認したうえで始めるときは、次の順で行ってください。
+- 本リポジトリのコードは **Apache License 2.0** で提供します（[`LICENSE`](LICENSE)）。
+  Copyright 2026 ATELIER LAB
+- 第三者由来コード（DiffSynth-Studio / Real-ESRGAN）の帰属と、モデル・weight の
+  ライセンス情報は [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) を参照してください。
+- **モデルの weight（MiniMax H3・MiniMax-H3-NF4・Turbo LoRA・realesr-animevideov3）は
+  本リポジトリに同梱していません。** 本リポジトリの Apache License 2.0 は、
+  利用者が別途取得するこれらの weight には適用されません。各配布元のライセンス
+  （特に MiniMax H3 の Community License にある地域・商用条件）を、
+  利用者自身で確認してください。
 
-**始める前の安全確認（すでに済ませてある内容）**
+**他の環境で使うときの補足**
 
-- `.gitignore` が次を除外していること — `.venv/`／モデル・LoRA（`*.safetensors` 等）／`data/`（動画・履歴・ログ・QR画像）／`config/config.toml`（各自の絶対パスを含む）／`.DS_Store`／`__pycache__`／`.claude/settings.local.json`
-- 公開されるのは `config/config.example.toml` のほう。個人名・ユーザー名・絶対パス・秘密情報は入っていません
+- `.gitignore` により、`.venv/`・モデル・LoRA（`*.safetensors` / `*.pth`）・
+  `data/`（動画・履歴・ログ・QR画像）・`config/config.toml`（各自の絶対パスを含む）は
+  Git 管理外です。公開されるのは `config/config.example.toml` のほうです
 - PIN は設計上どこにも保存されないため、除外すべきファイル自体が存在しません
-
-**推奨手順**
-
-```bash
-cd /path/to/atelier-h3-local-studio
-
-# 1) 何が追跡対象になるかを目視で確認する（71ファイル程度）
-git add -An .
-
-# 2) 個人情報・秘密情報が混ざっていないか最終確認
-git add -An . | sed "s/^add '//;s/'$//" | xargs grep -lE "password|secret|api_key" || echo "OK"
-
-# 3) 問題なければ初回コミット
-git add -A
-git commit -m "ATELIER H3 Local Studio V1.0.0"
-
-# 4) タグ（任意）
-git tag v1.0.0
-```
-
-**リモートへ公開する場合の注意**
-
-- 公開リポジトリにすると、プロンプト例や設計書の内容も公開されます
-- `data/` は除外されているので生成した動画・履歴は上がりませんが、**push 前に必ず `git status` で確認**してください
-- 他の Mac で使うときは `./scripts/setup.sh` を実行し、`config/config.toml` の `worker_python` と `working_directory` をその環境の DiffSynth-Studio の場所へ書き換えてください
+- 他の Mac で使うときは `./scripts/setup.sh` を実行し、`config/config.toml` の
+  `worker_python` と `working_directory` をその環境の DiffSynth-Studio の場所へ
+  書き換えてください

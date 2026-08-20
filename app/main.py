@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+# setdefault だと外から True を注入できてしまう。Analytics 無効は両モードで固定のため
+# 強制代入にする（CLAUDE.md・設計書 §15）。
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 import argparse
 import sys
@@ -165,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
             "share": False,                   # 外部公開しない（両モードで固定。設計書 §15）
             # 配信は成果物ディレクトリのみに限定する（ログや履歴JSONは配信しない）。
             # 整理済みの動画を置くディレクトリは**絶対に加えない**（§26.11）。
+            # data/tmp も加えない（QR画像がHTTPで見えてしまう）。継続サムネイルは
+            # UI がサーバ側で値として渡す個別ファイル（_servable(allow_tmp=True)）で、
+            # ここを広げなくても表示できる。
             "allowed_paths": [
                 str(cfg.outputs_dir),
                 str(cfg.concat_dir),

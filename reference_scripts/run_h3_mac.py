@@ -1,3 +1,5 @@
+# DiffSynth-Studio（Apache-2.0, https://github.com/modelscope/DiffSynth-Studio）の
+# MiniMax-H3 利用例に基づく実証スクリプト。帰属の詳細は THIRD-PARTY-NOTICES.md。
 import os
 
 os.environ["MODELSCOPE_DOMAIN"] = "www.modelscope.ai"

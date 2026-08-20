@@ -23,7 +23,8 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+# app/main.py と同じく強制代入（setdefault だと外部環境変数で上書きできてしまう）
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))

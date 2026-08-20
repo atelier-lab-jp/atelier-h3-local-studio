@@ -1,7 +1,44 @@
 # changelog.md — ATELIER H3 Local Studio 変更履歴
 
 時系列の変更履歴（新しいものを上に追記）。現在状態の正本は `ai_summary.md`。
-未公開プロジェクトのためリリース番号は付けず、フェーズ表記で管理する。
+開発中はフェーズ表記で管理してきた。`[Unreleased]` 見出しの整理（`v1.0.0` への統合）は、
+OSS 公開時の正式な v1.0.0 確定と同時に行う。
+
+---
+
+## [Unreleased] 2026-08-21 — OSS 公開準備（ライセンス・帰属・文書整備）
+
+公開内容を完成させる工程。生成機能のコードは無変更（挙動の変更は Analytics 環境変数の固定化のみ）。
+
+### Added
+- `LICENSE` — Apache License 2.0 の公式本文（無改変。本プロジェクトの copyright 表記は
+  Copyright 2026 ATELIER LAB。README §12 に記載）
+- `THIRD-PARTY-NOTICES.md` — DiffSynth-Studio（Apache-2.0）・Real-ESRGAN（BSD-3-Clause）の
+  帰属と、モデル weight（MiniMax H3 / MiniMax-H3-NF4 / Turbo LoRA / realesr-animevideov3）の
+  取得元・ライセンス情報。**weight は本リポジトリに同梱せず、本リポジトリの Apache-2.0 は
+  weight に適用されない**ことを明示
+- README — uv 必須の明記、clone 直後にモックモードで動作確認する導線、
+  「実モデルの準備」章（preflight が検査する実パスを記載）、
+  §12「ライセンスと第三者ソフトウェア」（モデルライセンスの中立的な注意書きを含む）
+- 由来コードへの帰属コメント — `reference_scripts/*.py`・
+  `app/engine/backends/minimax_h3/h3_worker.py`（DiffSynth-Studio 由来の用法）・
+  `app/postprocess/upscale_worker.py`（Real-ESRGAN の SRVGGNetCompact 互換実装）
+
+### Changed
+- `GRADIO_ANALYTICS_ENABLED` を `setdefault` から**強制代入**へ（`app/main.py`・
+  `scripts/real_stage_test.py`）。外部環境変数で Analytics を有効化できる経路を塞いだ
+- 公開境界の文書整合 — `_servable(allow_tmp=True)` は「継続サムネイル1件をサーバ側が
+  値として渡す」例外であり `allowed_paths` を広げないことを、docstring・`app/main.py`・
+  `CLAUDE.md` に明文化（コードの挙動は無変更）
+- README の stale な「Git 管理未開始・コミット0件」付録を削除し §12 へ置き換え
+- `ai_summary.md` を現在状態（全フェーズ完了・実 iPhone 確認済み・OSS 公開準備中）へ更新
+
+### 実機確認（2026-08-20）
+- **実 iPhone からの LANモード最終確認を完了**。接続・新規生成投入・実モデル生成完走・
+  完成動画の iPhone 上での再生・「完成・編集」/「履歴」タブへの反映・レスポンシブ表示を確認
+  （ジョブ `v_20260820_235040_brtj`: 56フレーム・24fps・4ステップ・約2.33秒・
+  seed 262872212・処理時間 約6分38秒・SUCCESS）
+- S9（Wi-Fi 断での完走）は未実施のまま（OSS 公開の BLOCKER とは扱わず、追加確認項目として残す）
 
 ---
 
@@ -533,6 +570,7 @@ x4plus ／ 余白を足す(pad)方式 ／ ネイティブ1080p生成 ／ フレ�
 - 重複1フレーム自動除去は**既定 OFF のまま**。有効にしても ffmpeg が埋め戻すため依頼した枚数は減らない（P4の実測結論を維持）
 - Gradio の `gr.Blocks(css=...)` は非推奨。動作はするが、将来 `launch(css=...)` へ移す必要がある
 - 実 iPhone での QR読取・PIN入力・再生・生成投入は**未確認**（エージェントが実行できないため）
+  → **2026-08-20 に実機確認を完了**（上の「OSS 公開準備」エントリを参照）
 
 ---
 
