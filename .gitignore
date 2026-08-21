@@ -47,7 +47,7 @@ config/config.local.toml
 .idea/
 .vscode/
 
-# ---- Claude Code のローカル設定 ----
+# ---- ローカル開発設定（エディタ・支援ツールの個人設定） ----
 .claude/settings.local.json
 
 # ---- テスト・実機試験の生成物 ----

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 # setdefault だと外から True を注入できてしまう。Analytics 無効は両モードで固定のため
-# 強制代入にする（CLAUDE.md・設計書 §15）。
+# 強制代入にする（設計書 §15）。
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 import argparse

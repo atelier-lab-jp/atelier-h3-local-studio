@@ -29,7 +29,7 @@ OSS 公開時の正式な v1.0.0 確定と同時に行う。
   `scripts/real_stage_test.py`）。外部環境変数で Analytics を有効化できる経路を塞いだ
 - 公開境界の文書整合 — `_servable(allow_tmp=True)` は「継続サムネイル1件をサーバ側が
   値として渡す」例外であり `allowed_paths` を広げないことを、docstring・`app/main.py`・
-  `CLAUDE.md` に明文化（コードの挙動は無変更）
+  開発規約に明文化（コードの挙動は無変更）
 - README の stale な「Git 管理未開始・コミット0件」付録を削除し §12 へ置き換え
 - `ai_summary.md` を現在状態（全フェーズ完了・実 iPhone 確認済み・OSS 公開準備中）へ更新
 
@@ -480,7 +480,7 @@ x4plus ／ 余白を足す(pad)方式 ／ ネイティブ1080p生成 ／ フレ�
 ## [Unreleased] 2026-08-09 — P5.1: UI操作性改善（プロンプト消去・選択欄の移動）
 
 小規模な UI 改修のみ。**生成エンジン・キュー契約・履歴スキーマ・設計契約は無変更**
-（`docs/v1-design.md` と `CLAUDE.md` は更新不要）。
+（`docs/v1-design.md` と開発規約は更新不要）。
 
 ### Added
 - **［プロンプトを消去］ボタン**（①新規生成タブ）— プロンプト入力欄の直下、
@@ -764,7 +764,7 @@ x4plus ／ 余白を足す(pad)方式 ／ ネイティブ1080p生成 ／ フレ�
 ## [Unreleased] 2026-08-07 — P0.5: 開発継続基盤と将来拡張境界
 
 ### Added
-- 開発継続文書 3点: `CLAUDE.md`（AI作業規約）／`ai_summary.md`（現在状態の正本）／`changelog.md`（本書）
+- 開発継続文書: `ai_summary.md`（現在状態の正本）／`changelog.md`（本書）。あわせて AI エージェント向けの開発規約（絶対制約・主要コマンド・文書更新規約）を整備（リポジトリ外で管理）
 - 設計書 §22「Generation Backend 境界」: Execution Engine（real/mock）と Generation Backend（minimax_h3）の用語分離、最小バックエンド契約（identity・lifecycle・capabilities・成果物契約）
 - config: `[engine]`（mode / backend）と `[backends.minimax_h3]` セクション（model_id / model_revision / worker_script 等の identity を含む）
 - preflight: 未登録 backend_id の日本語エラー拒否＋登録済み backend の情報表示
@@ -776,7 +776,7 @@ x4plus ／ 余白を足す(pad)方式 ／ ネイティブ1080p生成 ／ フレ�
 - 履歴スキーマ: `engine` を `execution_engine` に改名し、`backend_id` / `model_id` / `model_revision` / `backend_params` を追加（実データ発生前のため互換処理なし・最も単純な形に整理）
 - ワーカープロトコル: generate に `backend_id`、ready に `backend_id`+`capabilities`、done に backend/model 識別と `warnings` を追加（イベント種別は7種を維持）
 - `config.toml`: 旧 `[app] mock_mode`・`[paths] diffsynth_root/worker_python`・`[models]` を新構造へ統合
-- README に継続文書3点への案内を追加
+- README に継続文書への案内を追加
 
 ### Verified
 - 全テスト 36 passed + 1 xpassed

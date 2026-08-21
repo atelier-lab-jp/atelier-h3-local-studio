@@ -438,7 +438,7 @@ class RealEngine:
 
         プロンプトは stdin の JSON だけで渡す（コマンドライン引数へは載せない。§15）。
         """
-        # UI を迂回した不正値を下位層でも止める（設計書 §15・CLAUDE.md）
+        # UI を迂回した不正値を下位層でも止める（設計書 §15）
         validate_job_spec(spec, data_root=self._data_root)
         if spec.backend_id != self._identity.backend_id:
             raise ValidationError(

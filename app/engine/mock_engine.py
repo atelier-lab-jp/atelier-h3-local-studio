@@ -270,7 +270,7 @@ class MockEngine:
         thread.start()
 
     def submit(self, spec: JobSpec) -> None:
-        # UI を迂回した不正値を下位層でも止める（設計書 §15・CLAUDE.md）
+        # UI を迂回した不正値を下位層でも止める（設計書 §15）
         validate_job_spec(spec, data_root=self._data_root)
         # backend_id 不一致は ValidationError で返す。
         # 理由: MockEngine はプロセス内呼び出しなので、submit の同期例外で
