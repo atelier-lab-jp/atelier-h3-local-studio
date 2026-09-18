@@ -1,6 +1,6 @@
 [project]
 name = "atelier-h3-local-studio"
-version = "1.0.0"
+version = "1.0.1"
 description = "ATELIER H3 Local Studio - MiniMax-H3 完全ローカル動画生成スタジオ（UIプロセス側）"
 requires-python = ">=3.11"
 dependencies = [

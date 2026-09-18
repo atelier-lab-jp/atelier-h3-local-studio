@@ -121,6 +121,39 @@ cd ~/dev/atelier-h3-local-studio   # 実際に置いた場所に読み替えて�
 - 取得元 URL・ライセンス情報の詳細は
   [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) にまとめてあります。
 
+### アプリを新しい版へ更新する
+
+あなたの設定（`config/config.toml`）・生成した動画や記録（`data/`）・
+DiffSynth-Studio とモデル一式は、どの方法でも**そのまま残ります**。
+**今使っているフォルダを丸ごと削除・上書きしないでください。**
+
+**`git clone` で導入した場合**（おすすめ）:
+
+```
+cd ~/dev/atelier-h3-local-studio   # 実際に置いた場所に読み替えてください
+git pull
+```
+
+これだけで完了です（`config/config.toml`・`data/`・`.venv` は Git 管理外なので
+影響を受けません）。更新後にアプリを再起動してください。
+版によって依存関係が変わった場合に備え、起動に失敗したときは
+`./scripts/setup.sh` をもう一度実行してください（既存の config は上書きされません）。
+
+**ZIP でダウンロードして導入した場合**:
+
+1. GitHub の Releases から新しい版の ZIP を取得し、**新しいフォルダ**に展開します
+   （今のフォルダには上書きしません）
+2. 今のフォルダから新しいフォルダへ、次のものをコピーします
+   - `config/config.toml`（あなたの設定）
+   - `data/` フォルダ（生成した動画・記録。大きい場合は移動でも構いません）
+   - `app/assets/upscale/realesr-animevideov3.pth`（1080p高品質化のモデル。
+     取得済みの場合。無ければ後で `./scripts/setup.sh --with-upscale` でも可）
+3. 新しいフォルダで `./scripts/setup.sh` を実行します（`.venv` を作り直します）
+4. 新しいフォルダから起動して動作を確認できたら、古いフォルダは不要です
+
+DiffSynth-Studio・MiniMax-H3 のモデルはこのフォルダの**外**にあるため、
+どちらの方法でも再取得は不要です。
+
 ---
 
 ## 3. 起動と終了

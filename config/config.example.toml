@@ -13,7 +13,7 @@ schema_version = 1
 
 [app]
 name = "ATELIER H3 Local Studio"
-version = "1.0.0"
+version = "1.0.1"
 
 [engine]
 mode = "real"              # 実行方式（Execution Engine）: "real" | "mock"
