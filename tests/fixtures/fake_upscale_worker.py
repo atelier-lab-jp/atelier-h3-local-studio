@@ -5,10 +5,17 @@
 ffmpeg で 1920×1080 の映像を作る。UpscaleService の配線・進捗・取消・
 検証・原子的昇格を、実行時間 1 秒未満で確かめられるようにするためのもの。
 
+**本物と同じく、書き出す枚数は入力を実際に数えて決める**（2026-09-18 改訂）。
+以前は `--expected-frames` をそのまま鵜呑みにしていたため、「連結動画の実フレーム数が
+台帳の名目値より多い」という本物のワーカーの失敗（実測 745 / 想定 744）を
+テストで再現できなかった。数えた枚数が `--expected-frames` と食い違えば、
+本物のワーカーと同じ文言・同じ終了コードで失敗する（自己検査も本物と同じ）。
+
 環境変数で振る舞いを変えられる（テストが失敗経路を作るのに使う）:
   FAKE_UPSCALE_FAIL=1        ワーカー内エラーとして失敗する（終了コード2）
   FAKE_UPSCALE_SLEEP=秒      1フレームごとに待つ（取消のテスト用）
-  FAKE_UPSCALE_FRAMES=n      `--expected-frames` を無視してこの数だけ進捗を出す
+  FAKE_UPSCALE_FRAMES=n      入力を数えずこの枚数を書き、**成功と報告する**
+                             （自己検査をすり抜けた想定＝サービス側検証のテスト用）
   FAKE_UPSCALE_SIZE=WxH      1920x1080 以外を作る（検証が弾くことの確認用）
   FAKE_UPSCALE_WITH_AUDIO=1  映像だけでなく音声も入れる（音声を二重にしない確認）
 """
@@ -18,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -41,6 +49,23 @@ def ffmpeg_binary() -> str:
         return "ffmpeg"
 
 
+def count_source_frames(source: Path) -> int | None:
+    """入力の実フレーム数を数える（fps 変換なしのデコード計数）。
+
+    本物のワーカーは PyAV の `container.decode(video=0)` で数える。ここでは
+    同じ意味の値を ffmpeg のフルデコード（`-f null -`）で得る（av 非依存のまま）。
+    """
+    proc = subprocess.run(
+        [ffmpeg_binary(), "-nostdin", "-i", str(source), "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    matches = re.findall(r"frame=\s*(\d+)", proc.stderr or "")
+    return int(matches[-1]) if matches else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
@@ -59,14 +84,30 @@ def main(argv: list[str] | None = None) -> int:
         emit(RESULT_PREFIX, {"ok": False, "error": "書き出し先がすでに存在します"})
         return 2
 
-    frames = int(os.environ.get("FAKE_UPSCALE_FRAMES", "") or args.expected_frames or 8)
+    override = os.environ.get("FAKE_UPSCALE_FRAMES", "")
+    if override:
+        # 意図的に嘘をつくモード: 入力を数えず、自己検査もせず「成功」と報告する
+        frames = int(override)
+        honest = False
+    else:
+        counted = count_source_frames(source)
+        if not counted:
+            # 本物のワーカーが読めない入力に出す文言と揃える
+            emit(
+                RESULT_PREFIX,
+                {"ok": False, "error": "元の動画からフレームを1枚も読み取れませんでした"},
+            )
+            return 2
+        frames = counted
+        honest = True
+
     delay = float(os.environ.get("FAKE_UPSCALE_SLEEP", "") or 0)
     size = os.environ.get("FAKE_UPSCALE_SIZE", "") or "1920x1080"
 
     for i in range(1, frames + 1):
         if delay:
             time.sleep(delay)
-        emit(PROGRESS_PREFIX, {"frame": i, "total": frames})
+        emit(PROGRESS_PREFIX, {"frame": i, "total": args.expected_frames or 0})
 
     if os.environ.get("FAKE_UPSCALE_FAIL"):
         emit(RESULT_PREFIX, {"ok": False, "error": "テスト用の失敗です"})
@@ -88,6 +129,20 @@ def main(argv: list[str] | None = None) -> int:
         tail = (result.stderr or "").strip().splitlines()
         emit(RESULT_PREFIX, {"ok": False, "error": tail[-1] if tail else "ffmpeg に失敗"})
         return 3
+
+    # 本物のワーカーと同じ位置（書き出し完了後）・同じ文言の自己検査
+    if honest and args.expected_frames and frames != args.expected_frames:
+        emit(
+            RESULT_PREFIX,
+            {
+                "ok": False,
+                "error": (
+                    f"フレーム数が想定と違います"
+                    f"（実測 {frames} / 想定 {args.expected_frames}）"
+                ),
+            },
+        )
+        return 2
 
     width, _, height = size.partition("x")
     emit(

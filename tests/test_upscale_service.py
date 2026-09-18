@@ -30,6 +30,7 @@ from app.core.upscale_service import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FAKE_WORKER = PROJECT_ROOT / "tests" / "fixtures" / "fake_upscale_worker.py"
+MOCK_DIR = PROJECT_ROOT / "app" / "assets" / "mock"
 
 FPS = 24
 FRAMES = 8
@@ -41,12 +42,14 @@ def ffmpeg_binary() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def make_source(path: Path, *, frames: int = FRAMES, audio: bool = True) -> Path:
+def make_source(
+    path: Path, *, frames: int = FRAMES, audio: bool = True, rate: int = FPS
+) -> Path:
     """576×320 の元動画を作る（実モデルは使わない）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_binary(), "-y", "-nostdin",
-        "-f", "lavfi", "-i", f"testsrc=size=576x320:rate={FPS}",
+        "-f", "lavfi", "-i", f"testsrc=size=576x320:rate={rate}",
     ]
     if audio:
         cmd += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"]
@@ -294,6 +297,187 @@ def test_missing_source_fails_cleanly(cfg, service):
     assert status.state == STATE_FAILED
     assert not req.output_path.exists()
     assert list(cfg.upscaled_dir.iterdir()) == []
+
+
+# ============================================================ 実測基準（2026-09-18 修正）
+#
+# 検証基準は台帳・履歴の**名目フレーム数ではなく入力の実測フレーム数**（§26.5 改訂）。
+# 連結成果物は §10.6.2 のとおり名目合計より最大 ceil((n−1)×0.768) フレーム多くて
+# 正常であり、名目値との厳密一致を要求すると正常な連結動画で必ず失敗する
+# （実例: cm_20260918_223331_qhrd、実測 745 / 名目 744）。
+# 素材は ffmpeg_ops の実測表に記録済みの mock_124.mp4（音声が映像より
+# +0.416 フレーム/境界 長い）を、本番と同じ concat_reencode() で連結して作る。
+
+
+def concat_mocks(service, out_path: Path, clip: str, n: int, nominal: int) -> int:
+    """モック素材を本番の連結関数でつなぎ、実測フレーム数を返す。"""
+    from app.core import ffmpeg_ops as fo
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fo.concat_reencode(
+        service.ffmpeg,
+        [MOCK_DIR / clip] * n,
+        out_path,
+        fps=FPS,
+        sample_rate=32000,
+        expected_frames=nominal,
+    )
+    actual = fo.decode_probe(service.ffmpeg, out_path).frames
+    assert actual is not None
+    return actual
+
+
+def test_a_concat_with_more_frames_than_nominal_upscales_by_measured_count(cfg, service):
+    """§10.6.2 が正当に許容した「名目より多い」連結動画を高品質化できる。
+
+    修正前はワーカーが名目値を渡され、
+    「フレーム数が想定と違います（実測 621 / 想定 620）」で必ず失敗していた
+    （実機の cm_20260918_223331_qhrd と同じ機構・同じ文言）。
+    """
+    nominal = 124 * 5
+    source = cfg.concat_dir / "cm_20260918_120000_test_5clips.mp4"
+    actual = concat_mocks(service, source, "mock_124.mp4", 5, nominal)
+    assert actual > nominal, (
+        "この素材では超過フレームが再現していない（テストの前提が崩れている）: "
+        f"実測 {actual} / 名目 {nominal}"
+    )
+
+    req = UpscaleRequest(
+        source_key="concat:cm_20260918_120000_test",
+        source_path=source,
+        output_path=cfg.upscaled_dir / "u_manual_cm_20260918_120000_test_1080p.mp4",
+        num_frames=nominal,  # AppService が渡すのは台帳の名目値のまま（変更しない）
+        fps=FPS,
+        label="連結テスト",
+    )
+    service.start_upscale(req)
+    status = wait_until_done(service, timeout=300)
+
+    assert status.state == STATE_SUCCEEDED, status.message
+    assert status.total == actual, "進捗の分母が実測値になっていない"
+    assert status.frame == actual
+
+    from app.core import ffmpeg_ops as fo
+
+    probe = fo.decode_probe(service.ffmpeg, req.output_path)
+    assert probe.frames == actual, "出力の枚数が入力の実測値と一致していない"
+    assert "1920x1080" in probe.video_desc
+    assert probe.has_audio
+
+
+def test_a_chain_concat_with_a_terminal_clip_nominal_succeeds(cfg, service):
+    """チェーン連結の行は終端クリップ単体の枚数（例: 56）しか持っていない。
+
+    実測基準なら、名目が半分でも 2 本連結（112 枚）をそのまま高品質化できる。
+    修正前は「実測 112 / 想定 56」で必ず失敗していた。
+    """
+    source = cfg.concat_dir / "c_v_20260918_120001_test_2clips.mp4"
+    actual = concat_mocks(service, source, "mock_56.mp4", 2, 56 * 2)
+    assert actual == 112
+
+    req = UpscaleRequest(
+        source_key="concat:v_20260918_120001_test",
+        source_path=source,
+        output_path=cfg.upscaled_dir / "u_chain_v_20260918_120001_test_1080p.mp4",
+        num_frames=56,  # 終端クリップ単体の名目値（現状の _row() が載せる値）
+        fps=FPS,
+        label="チェーンテスト",
+    )
+    service.start_upscale(req)
+    status = wait_until_done(service, timeout=300)
+
+    assert status.state == STATE_SUCCEEDED, status.message
+    assert status.total == actual
+
+    from app.core import ffmpeg_ops as fo
+
+    assert fo.decode_probe(service.ffmpeg, req.output_path).frames == actual
+
+
+def test_the_worker_receives_the_measured_frame_count(cfg, service, monkeypatch):
+    """ワーカーの `--expected-frames` には名目値ではなく**実測値**が渡る。"""
+    calls = record_subprocess_calls(monkeypatch)
+    source = make_source(cfg.outputs_dir / "v_20260918_120002_aaaa.mp4")  # 実測 8 枚
+    req = dataclasses.replace(request_for(cfg, source), num_frames=6)  # 名目は故意にずらす
+
+    service.start_upscale(req)
+    status = wait_until_done(service)
+
+    assert status.state == STATE_SUCCEEDED, status.message
+    args = [str(a) for a in worker_call(calls)["args"]]
+    assert args[args.index("--expected-frames") + 1] == str(FRAMES)
+    assert status.total == FRAMES
+
+    from app.core import ffmpeg_ops as fo
+
+    assert fo.decode_probe(service.ffmpeg, req.output_path).frames == FRAMES
+
+
+def test_fewer_frames_than_the_source_are_rejected(cfg, service, monkeypatch):
+    """ワーカー出力が実測より**少ない**場合も昇格させない（増える側は既存試験）。
+
+    FAKE_UPSCALE_FRAMES はワーカーの自己検査をすり抜けた想定なので、
+    これはサービス側の出力検証（第2層）が働くことの確認になる。
+    """
+    monkeypatch.setenv("FAKE_UPSCALE_FRAMES", str(FRAMES - 3))
+    source = make_source(cfg.outputs_dir / "v_20260918_120003_bbbb.mp4")
+    req = request_for(cfg, source)
+
+    service.start_upscale(req)
+    status = wait_until_done(service)
+
+    assert status.state == STATE_FAILED
+    assert "フレーム数" in (status.error or "")
+    assert not req.output_path.exists()
+    assert list(cfg.upscaled_dir.iterdir()) == []
+
+
+def test_an_unmeasurable_source_fails_before_the_worker_starts(cfg, service, monkeypatch):
+    """入力を計測できないときは名目値へフォールバックせず、**ワーカーを起動しない**。
+
+    失敗のあとは待機状態へ戻り、次の高品質化を普通に受け付ける。
+    """
+    calls = record_subprocess_calls(monkeypatch)
+    broken = cfg.outputs_dir / "v_20260918_120004_cccc.mp4"
+    broken.write_bytes(b"this is not a video")
+    req = request_for(cfg, broken)
+
+    service.start_upscale(req)
+    status = wait_until_done(service)
+
+    assert status.state == STATE_FAILED
+    assert "読み取れませんでした" in (status.error or "")
+    assert not any(
+        any(str(a).endswith("fake_upscale_worker.py") for a in call["args"])
+        for call in calls
+    ), "計測に失敗したのにワーカーが起動している"
+    assert not req.output_path.exists()
+    assert list(cfg.upscaled_dir.iterdir()) == []
+
+    # 後続の1件は普通に成功する（排他が解除されている）
+    good = make_source(cfg.outputs_dir / "v_20260918_120005_dddd.mp4")
+    service.start_upscale(request_for(cfg, good))
+    assert wait_until_done(service).state == STATE_SUCCEEDED
+
+
+def test_a_source_with_a_different_fps_is_refused(cfg, service, monkeypatch):
+    """24fps と整合しない動画は、実測枚数÷fps の食い違いとして開始前に弾く。"""
+    calls = record_subprocess_calls(monkeypatch)
+    source = make_source(
+        cfg.outputs_dir / "v_20260918_120006_eeee.mp4", frames=90, rate=30
+    )  # 実測 90 枚・約 3.0 秒（24fps なら 3.75 秒のはず）
+    req = dataclasses.replace(request_for(cfg, source), num_frames=90)
+
+    service.start_upscale(req)
+    status = wait_until_done(service)
+
+    assert status.state == STATE_FAILED
+    assert "24fps ではない" in (status.error or "")
+    assert not any(
+        any(str(a).endswith("fake_upscale_worker.py") for a in call["args"])
+        for call in calls
+    )
+    assert not req.output_path.exists()
 
 
 # ============================================================ 事前確認
